@@ -8,7 +8,7 @@
   4. 数据持久化：配置保存在程序同目录的 click_positions.json，重启、换机都不丢
   5. 多方案管理：新建 / 复制 / 重命名 / 删除，方案之间数据完全独立
   6. 全局热键启停（默认 F12，可自定义任意键）
-  7. 按住右键：持续发送右键按下信号，再点一次松开
+  7. 按住右键：可点按钮、可按独立热键随时开关，也可设成随点击一起运行
 """
 
 import ctypes
@@ -93,12 +93,13 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v21"
+APP_VERSION = "v22"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
 MAX_INTERVAL = 7200.0     # 最大间隔（秒），即 2 小时
 DEFAULT_HOTKEY = "f12"
+DEFAULT_RIGHT_HOTKEY = "f8"   # 按住右键的独立热键
 DEFAULT_JITTER_MIN = 0.5  # 随机倍率下限
 DEFAULT_JITTER_MAX = 2.0  # 随机倍率上限
 
@@ -229,6 +230,10 @@ def normalize_profile(raw):
     raw = raw if isinstance(raw, dict) else {}
     profile = {
         "hotkey": normalize_key_name(raw.get("hotkey") or raw.get("hotkey_vk")) or DEFAULT_HOTKEY,
+        "right_hotkey": (normalize_key_name(raw.get("right_hotkey")
+                                            or raw.get("right_hold_hotkey"))
+                         or DEFAULT_RIGHT_HOTKEY),
+        "auto_right_hold": bool(raw.get("auto_right_hold", False)),
         "jitter_enabled": bool(raw.get("jitter_enabled", True)),
         "jitter_min": float(raw.get("jitter_min", DEFAULT_JITTER_MIN) or DEFAULT_JITTER_MIN),
         "jitter_max": float(raw.get("jitter_max", DEFAULT_JITTER_MAX) or DEFAULT_JITTER_MAX),
@@ -471,6 +476,10 @@ class AutoClicker:
         self.items = []
         self.hotkey = DEFAULT_HOTKEY
         self.hotkey_handle = None
+        self.right_hotkey = DEFAULT_RIGHT_HOTKEY
+        self.right_hotkey_handle = None
+        self.auto_right_hold = False
+        self.right_held_auto = False
         self.default_interval = 1.0
         self.jitter_on = True
         self.jitter_min = DEFAULT_JITTER_MIN
@@ -487,9 +496,9 @@ class AutoClicker:
 
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.root.minsize(640, 600)
+        self.root.minsize(640, 660)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._center_window(680, 660)
+        self._center_window(680, 720)
 
         self._build_ui()
         self._load_profile(self.current_profile)
@@ -553,6 +562,16 @@ class AutoClicker:
         for var in (self.jitter_min_var, self.jitter_max_var):
             var.trace_add("write", lambda *_: self._on_change())
 
+        row3 = ttk.Frame(setting_bar)
+        row3.pack(fill=tk.X, padx=8, pady=(2, 6))
+        ttk.Label(row3, text="按住右键热键").pack(side=tk.LEFT)
+        self.right_hotkey_var = tk.StringVar(value=key_display(self.right_hotkey))
+        ttk.Label(row3, textvariable=self.right_hotkey_var, width=12, anchor=tk.CENTER,
+                  relief=tk.SUNKEN).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row3, text="设置热键", width=10,
+                   command=self._start_set_right_hotkey).pack(side=tk.LEFT)
+        ttk.Label(row3, text="随时按此键开关按住右键，与是否在运行无关").pack(side=tk.LEFT, padx=(12, 0))
+
         # 位置列表
         list_bar = ttk.LabelFrame(self.root, text="执行列表")
         list_bar.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
@@ -603,6 +622,13 @@ class AutoClicker:
         self.btn_right.pack(side=tk.LEFT, padx=4)
         ttk.Button(control_bar, text="清空列表", width=12, command=self._clear_items).pack(side=tk.LEFT, padx=4)
 
+        option_bar = ttk.Frame(self.root)
+        option_bar.pack(fill=tk.X, padx=8, pady=(4, 0))
+        self.auto_right_hold_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(option_bar, text="运行开始时同步按住右键（停止时自动松开）",
+                        variable=self.auto_right_hold_var,
+                        command=self._on_change).pack(side=tk.LEFT)
+
         # 状态栏
         self.status_var = tk.StringVar(value="已停止")
         ttk.Label(self.root, textvariable=self.status_var, anchor=tk.W,
@@ -622,6 +648,8 @@ class AutoClicker:
     def _collect_profile(self):
         return {
             "hotkey": self.hotkey,
+            "right_hotkey": self.right_hotkey,
+            "auto_right_hold": bool(self.auto_right_hold_var.get()),
             "jitter_enabled": bool(self.jitter_on_var.get()),
             "jitter_min": self._safe_float(self.jitter_min_var.get(), DEFAULT_JITTER_MIN),
             "jitter_max": self._safe_float(self.jitter_max_var.get(), DEFAULT_JITTER_MAX),
@@ -635,6 +663,9 @@ class AutoClicker:
         self.items = [dict(item) for item in profile["items"]]
         self.hotkey = profile["hotkey"]
         self.hotkey_var.set(key_display(self.hotkey))
+        self.right_hotkey = profile["right_hotkey"]
+        self.right_hotkey_var.set(key_display(self.right_hotkey))
+        self.auto_right_hold_var.set(profile["auto_right_hold"])
         self.jitter_on_var.set(profile["jitter_enabled"])
         self.jitter_min_var.set(f"{profile['jitter_min']:g}")
         self.jitter_max_var.set(f"{profile['jitter_max']:g}")
@@ -687,13 +718,8 @@ class AutoClicker:
             return
         self._save_now()
         source = self._collect_profile()
-        self.profiles[name] = {
-            "hotkey": source["hotkey"],
-            "jitter_enabled": source["jitter_enabled"],
-            "jitter_min": source["jitter_min"],
-            "jitter_max": source["jitter_max"],
-            "items": [dict(item) for item in source["items"]],
-        }
+        source["items"] = [dict(item) for item in source["items"]]
+        self.profiles[name] = source
         self._load_profile(name)
         self._save_now()
 
@@ -1073,6 +1099,9 @@ class AutoClicker:
     def _start_set_hotkey(self):
         self._start_key_capture("hotkey", "请按下要作为启停热键的按键…")
 
+    def _start_set_right_hotkey(self):
+        self._start_key_capture("right_hotkey", "请按下要作为「按住右键」热键的按键…")
+
     def _start_key_capture(self, target, prompt="请按下要绑定的按键…"):
         if not HAS_KEYBOARD:
             messagebox.showwarning(APP_NAME, "当前环境没有 keyboard 库，无法采集按键。", parent=self.root)
@@ -1104,11 +1133,25 @@ class AutoClicker:
             self.status_var.set("没有采集到按键")
             return
         if target == "hotkey":
-            self.hotkey = normalize_key_name(name) or DEFAULT_HOTKEY
+            hotkey = normalize_key_name(name) or DEFAULT_HOTKEY
+            if hotkey == self.right_hotkey:
+                self.status_var.set(f"{key_display(hotkey)} 已用于按住右键，请换一个键")
+                return
+            self.hotkey = hotkey
             self.hotkey_var.set(key_display(self.hotkey))
             self._register_hotkey()
             self._on_change()
             self.status_var.set(f"启停热键已设为 {key_display(self.hotkey)}")
+        elif target == "right_hotkey":
+            right_hotkey = normalize_key_name(name) or DEFAULT_RIGHT_HOTKEY
+            if right_hotkey == self.hotkey:
+                self.status_var.set(f"{key_display(right_hotkey)} 已用于启停，请换一个键")
+                return
+            self.right_hotkey = right_hotkey
+            self.right_hotkey_var.set(key_display(self.right_hotkey))
+            self._register_hotkey()
+            self._on_change()
+            self.status_var.set(f"按住右键热键已设为 {key_display(self.right_hotkey)}")
         elif target == "new_item":
             key_name = normalize_key_name(name) or name
             self.items.append({
@@ -1130,24 +1173,39 @@ class AutoClicker:
     # ── 全局热键 ────────────────────────────────────────────────────────────
     def _register_hotkey(self):
         self._unregister_hotkey()
-        if not HAS_KEYBOARD or not self.hotkey:
+        if not HAS_KEYBOARD:
             return
-        try:
-            self.hotkey_handle = keyboard.add_hotkey(self.hotkey, self._on_hotkey, suppress=False)
-        except Exception as exc:
-            self.hotkey_handle = None
-            self.status_var.set(f"热键 {key_display(self.hotkey)} 注册失败：{exc}")
+        if self.hotkey:
+            try:
+                self.hotkey_handle = keyboard.add_hotkey(self.hotkey, self._on_hotkey, suppress=False)
+            except Exception as exc:
+                self.hotkey_handle = None
+                self.status_var.set(f"热键 {key_display(self.hotkey)} 注册失败：{exc}")
+        # 按住右键的独立热键；与启停热键相同时跳过，避免同一个键被注册两次
+        if self.right_hotkey and self.right_hotkey != self.hotkey:
+            try:
+                self.right_hotkey_handle = keyboard.add_hotkey(self.right_hotkey,
+                                                               self._on_right_hotkey, suppress=False)
+            except Exception as exc:
+                self.right_hotkey_handle = None
+                self.status_var.set(f"热键 {key_display(self.right_hotkey)} 注册失败：{exc}")
 
     def _unregister_hotkey(self):
-        if self.hotkey_handle is not None and keyboard is not None:
-            try:
-                keyboard.remove_hotkey(self.hotkey_handle)
-            except Exception:
-                pass
+        if keyboard is not None:
+            for handle in (self.hotkey_handle, self.right_hotkey_handle):
+                if handle is not None:
+                    try:
+                        keyboard.remove_hotkey(handle)
+                    except Exception:
+                        pass
         self.hotkey_handle = None
+        self.right_hotkey_handle = None
 
     def _on_hotkey(self):
         self.ui_queue.put(("toggle", None))
+
+    def _on_right_hotkey(self):
+        self.ui_queue.put(("right_toggle", None))
 
     # ── 主线程消息泵 ────────────────────────────────────────────────────────
     def _pump_queue(self):
@@ -1165,6 +1223,8 @@ class AutoClicker:
                 self._stop_clicking()
             else:
                 self._start_clicking()
+        elif kind == "right_toggle":
+            self._toggle_right_hold()
         elif kind == "status":
             self.status_var.set(message[1])
         elif kind == "stopped":
@@ -1202,6 +1262,8 @@ class AutoClicker:
         self.running = True
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
+        if self.auto_right_hold_var.get():
+            self._press_right(auto=True)
         self.click_thread = threading.Thread(target=self._click_loop, daemon=True)
         self.click_thread.start()
 
@@ -1211,6 +1273,8 @@ class AutoClicker:
         self.running = False
         self.btn_start.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.DISABLED)
+        if self.right_held and self.right_held_auto:
+            self._release_right()
         self.status_var.set("已停止")
 
     def _click_loop(self):
@@ -1247,14 +1311,15 @@ class AutoClicker:
         else:
             self._press_right()
 
-    def _press_right(self):
+    def _press_right(self, auto=False):
         if self.right_held:
             return
         self.right_held = True
+        self.right_held_auto = bool(auto)
         self.right_thread = threading.Thread(target=self._right_hold_loop, daemon=True)
         self.right_thread.start()
         self.btn_right.config(text="松开右键")
-        self.status_var.set("右键已按住（再次点击按钮松开）")
+        self.status_var.set("右键已按住（点按钮或按热键松开）")
 
     def _right_hold_loop(self):
         # 每 50 毫秒重复发送一次按下信号，游戏才认得住
@@ -1266,6 +1331,7 @@ class AutoClicker:
         if not self.right_held:
             return
         self.right_held = False
+        self.right_held_auto = False
         mouse_right_up()
         self.btn_right.config(text="按住右键")
         self.status_var.set("右键已松开")
@@ -1314,6 +1380,10 @@ def run_selftest():
         f"数据文件可写：{'是' if os.access(os.path.dirname(CONFIG_PATH), os.W_OK) else '否'}",
         f"方案数量：{len(cfg['profiles'])}（{', '.join(cfg['profiles'].keys())}）",
         f"键盘库 keyboard：{'可用' if HAS_KEYBOARD else '不可用'}",
+        "热键：启停 {} / 按住右键 {} / 运行开始时同步按住右键：{}".format(
+            key_display(cfg["profiles"][cfg["current_profile"]]["hotkey"]),
+            key_display(cfg["profiles"][cfg["current_profile"]]["right_hotkey"]),
+            "是" if cfg["profiles"][cfg["current_profile"]]["auto_right_hold"] else "否"),
         f"管理员权限：{'是' if is_admin() else '否'}",
         f"Tcl/Tk 运行库：{TCL_RUNTIME or '使用系统自带（源码运行）'}",
         f"Python：{sys.version.split()[0]}",

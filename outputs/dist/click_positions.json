@@ -1,9 +1,11 @@
 {
   "version": 2,
-  "current_profile": "生化速刷",
+  "current_profile": "清卡机-卡槽一 0.1版本",
   "profiles": {
     "生化": {
       "hotkey": "down",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
@@ -11,6 +13,8 @@
     },
     "常规": {
       "hotkey": "down",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
@@ -18,6 +22,8 @@
     },
     "生化速刷": {
       "hotkey": "down",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
@@ -25,6 +31,8 @@
     },
     "生化速刷1": {
       "hotkey": "down",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
@@ -32,6 +40,8 @@
     },
     "挑战": {
       "hotkey": "down",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
@@ -39,6 +49,8 @@
     },
     "方案7": {
       "hotkey": "down",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
@@ -46,6 +58,8 @@
     },
     "1360x768生化速刷": {
       "hotkey": "down",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
@@ -53,13 +67,25 @@
     },
     "清卡机-卡槽一 0.1版本": {
       "hotkey": "up",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
-      "jitter_max": 2.0,
-      "items": []
+      "jitter_max": 1.5,
+      "items": [
+        {
+          "type": "mouse",
+          "name": "点击1",
+          "interval": 0.1,
+          "x": 831,
+          "y": 560
+        }
+      ]
     },
     "清卡机-卡槽二 0.1版本": {
       "hotkey": "right",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
@@ -67,6 +93,8 @@
     },
     "清卡机-卡槽三 0.1版本": {
       "hotkey": "right",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
@@ -74,13 +102,8 @@
     },
     "清卡机-卡槽二 3s版本": {
       "hotkey": "up",
-      "jitter_enabled": true,
-      "jitter_min": 0.5,
-      "jitter_max": 2.0,
-      "items": []
-    },
-    "方案11": {
-      "hotkey": "up",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,

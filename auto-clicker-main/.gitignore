@@ -1,0 +1,13 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 程序运行时生成的内容
+# runtime 是 Tcl/Tk 界面运行库，程序首次启动会自动释放到 exe 旁边
+outputs/dist/runtime/
+outputs/dist/selftest.txt
+
+# 开发工作区：PyInstaller 打包缓存、临时脚本、测试产生的数据
+work/
+# 配置文件的自动备份，属于本机运行数据
+outputs/dist/*.bak

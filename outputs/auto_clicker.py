@@ -95,7 +95,7 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v24"
+APP_VERSION = "v25"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -165,7 +165,17 @@ def _bezier_curve(p0, p1, p2, p3, steps):
     return points
 
 
+def _pixel_to_abs(x, y):
+    """将像素坐标转换为 SendInput 绝一坐标 (0-65535)。"""
+    sw = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+    sh = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+    if sw <= 0: sw = 1920
+    if sh <= 0: sh = 1080
+    return int(x * 65535 / sw), int(y * 65535 / sh)
+
+
 def human_move_to(target_x, target_y, duration=None):
+    """贝塞尔曲线移动鼠标到目标像素坐标，SendInput 内部自动归一化。"""
     cur_x, cur_y = get_cursor_pos()
     dist = ((target_x - cur_x)**2 + (target_y - cur_y)**2) ** 0.5
     if dist < 2:
@@ -187,9 +197,11 @@ def human_move_to(target_x, target_y, duration=None):
         if i > len(curve) * 0.7:
             px += random.uniform(-1, 1)
             py += random.uniform(-1, 1)
-        _send_mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, dx=px, dy=py)
+        ax, ay = _pixel_to_abs(px, py)
+        _send_mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, dx=ax, dy=ay)
         time.sleep(interval * random.uniform(0.8, 1.2))
-    _send_mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, dx=target_x, dy=target_y)
+    ax, ay = _pixel_to_abs(target_x, target_y)
+    _send_mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, dx=ax, dy=ay)
 
 
 

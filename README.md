@@ -9,7 +9,7 @@
 
 **直接下载最新版 exe：** 👉 [ Releases 页面](https://github.com/xyz0218xy-ops/auto-clicker/releases/latest)
 
-> 双击 `自动点击器.exe` 即可运行，无需安装 Python。建议右键「以管理员身份运行」。
+> 双击 `AutoClicker-v25.exe` 即可运行，无需安装 Python。建议右键「以管理员身份运行」。
 
 ## 功能
 
@@ -27,12 +27,16 @@
 
 详见 [CHANGELOG.md](CHANGELOG.md)
 
-### 最新版本 v24 (2026-09-20)
+### 最新版本 v25 (2026-09-21)
+- 修复鼠标点击位置偏移问题（SendInput 绝一坐标归一化）
+- 修复点击一次就自动暂停的问题
+
+### 上一版本 v24 (2026-09-20)
 - 用 SendInput 替代 mouse_event，更底层更难被检测
 - 新增贝塞尔曲线鼠标移动，模拟真人手部轨迹
 - 点击前 ±2px 随机偏移 + 移动末尾微抖动
 - 右键按住改为 30-80ms 随机间隔，消除固定频率特征
-- 修复键盘库缺失导致热键不可用的问题
+- 修复键盘库缺失导致热键不可用问题
 
 ## 目录结构
 
@@ -42,14 +46,14 @@ outputs/
   build_exe.ps1             一键打包脚本
   README.md                 完整使用说明
   dist/
-    自动点击器.exe           单文件程序，双击运行
+    AutoClicker-v25.exe     单文件程序，双击运行
     click_positions.json    方案数据
 work/                       打包缓存（不入库）
 ```
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/xyz0218xy-ops/auto-clicker/releases/latest) 下载 `自动点击器.exe`
+1. 从 [Releases](https://github.com/xyz0218xy-ops/auto-clicker/releases/latest) 下载 `AutoClicker-v25.exe`
 2. 点「采集点击」→ 3 秒内把鼠标移到目标位置
 3. 需要按键就点「采集按键」
 4. 按 F12 开始 / 停止

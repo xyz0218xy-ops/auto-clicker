@@ -1,6 +1,15 @@
-# 自动点击器（Windows 鼠标 / 键盘自动化工具）
+﻿# 自动点击器（Windows 鼠标 / 键盘自动化工具）
+
+[![GitHub release](https://img.shields.io/github/v/release/xyz0218xy-ops/auto-clicker?style=flat-square)](https://github.com/xyz0218xy-ops/auto-clicker/releases)
+[![GitHub downloads](https://img.shields.io/github/downloads/xyz0218xy-ops/auto-clicker/total?style=flat-square)](https://github.com/xyz0218xy-ops/auto-clicker/releases)
 
 一个用 Python 标准库（tkinter + ctypes）写的桌面自动点击 / 按键工具，打包为单文件 exe，目标电脑不需要安装 Python。
+
+## 下载
+
+**直接下载最新版 exe：** 👉 [ Releases 页面](https://github.com/xyz0218xy-ops/auto-clicker/releases/latest)
+
+> 双击 `自动点击器.exe` 即可运行，无需安装 Python。建议右键「以管理员身份运行」。
 
 ## 功能
 
@@ -14,22 +23,33 @@
 - **数据不丢**：配置存在 exe 同目录，原子写入 + 自动备份，换电脑直接拷贝
 - **全局热键**：默认 F12，可改绑，游戏全屏时也能触发
 
+## 更新日志
+
+详见 [CHANGELOG.md](CHANGELOG.md)
+
+### 最新版本 v24 (2026-09-20)
+- 用 SendInput 替代 mouse_event，更底层更难被检测
+- 新增贝塞尔曲线鼠标移动，模拟真人手部轨迹
+- 点击前 ±2px 随机偏移 + 移动末尾微抖动
+- 右键按住改为 30-80ms 随机间隔，消除固定频率特征
+- 修复键盘库缺失导致热键不可用的问题
+
 ## 目录结构
 
 ```
 outputs/
-  auto_clicker.py           源码（Python 3.8 + tkinter）
-  build_exe.ps1             一键打包脚本（已含 Tcl/Tk 运行库参数）
+  auto_clicker.py           源码（Python 3.14 + tkinter）
+  build_exe.ps1             一键打包脚本
   README.md                 完整使用说明
   dist/
     自动点击器.exe           单文件程序，双击运行
-    click_positions.json    方案数据（采集点、热键、随机倍率）
-work/                       开发工作区（打包缓存与测试脚本，不入库）
+    click_positions.json    方案数据
+work/                       打包缓存（不入库）
 ```
 
 ## 快速开始
 
-1. 双击 `outputs/dist/自动点击器.exe`
+1. 从 [Releases](https://github.com/xyz0218xy-ops/auto-clicker/releases/latest) 下载 `自动点击器.exe`
 2. 点「采集点击」→ 3 秒内把鼠标移到目标位置
 3. 需要按键就点「采集按键」
 4. 按 F12 开始 / 停止
@@ -40,12 +60,11 @@ work/                       开发工作区（打包缓存与测试脚本，不�
 ## 打包
 
 ```powershell
+python -m pip install keyboard pyinstaller
 powershell -ExecutionPolicy Bypass -File outputs\build_exe.ps1
 ```
 
-> 本机 Python 3.8.6 自带的 PyInstaller 不会自动收集 Tcl/Tk 运行库，脚本里已显式带上 tcl / tk 目录与 dll，否则打包后界面会报 `Can't find a usable init.tcl`。
-
 ## 免责说明
 
-- 主流游戏的反作弊系统（如穿越火线 ACE）会校验输入是否来自真实硬件设备，软件层模拟输入（`mouse_event` / `SendInput` / `PostMessage`）可能被识别并拦截，这属于内核级限制。
-- 请确认使用行为符合目标软件的用户协议，仅用于合法的自动化场景。
+- 本工具仅用于合法的自动化测试场景，请确认使用行为符合目标软件的用户协议。
+- 本工具通过软件层模拟输入（SendInput），不涉及游戏进程注入或内存修改。

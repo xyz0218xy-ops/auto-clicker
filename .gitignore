@@ -11,3 +11,7 @@ outputs/dist/selftest.txt
 work/
 # 閰嶇疆鏂囦欢鐨勮嚜鍔ㄥ浠斤紝灞炰簬鏈満杩愯鏁版嵁
 outputs/dist/*.bak
+
+# 打包产物不入库
+*.exe
+work/

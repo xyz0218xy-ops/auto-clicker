@@ -9,6 +9,8 @@
   5. 多方案管理：新建 / 复制 / 重命名 / 删除，方案之间数据完全独立
   6. 全局热键启停（默认 F12，可自定义任意键）
   7. 按住右键：可点按钮、可按独立热键随时开关，也可设成随点击一起运行
+  8. 相对偏移：鼠标项可填「相对上一个鼠标点的偏移量」，不必重新采集
+  9. 轮次间隔：每一轮循环之间可以单独设置等待时间
 """
 
 import ctypes
@@ -93,11 +95,12 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v22"
+APP_VERSION = "v23"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
 MAX_INTERVAL = 7200.0     # 最大间隔（秒），即 2 小时
+MAX_OFFSET = 2000         # 相对偏移允许的最大像素数，避免填出离谱的坐标
 DEFAULT_HOTKEY = "f12"
 DEFAULT_RIGHT_HOTKEY = "f8"   # 按住右键的独立热键
 DEFAULT_JITTER_MIN = 0.5  # 随机倍率下限
@@ -216,6 +219,8 @@ def normalize_item(raw):
         except (TypeError, ValueError):
             item["x"] = 0
             item["y"] = 0
+        # rel 表示 x/y 存的是「相对上一个鼠标点的偏移量」；旧数据没有这个字段，一律按绝对坐标处理
+        item["mode"] = "rel" if str(raw.get("mode", "") or "").lower() == "rel" else "abs"
     else:
         key_name = normalize_key_name(raw.get("key"))
         if not key_name:
@@ -226,6 +231,15 @@ def normalize_item(raw):
     return item
 
 
+def safe_seconds(value, default=0.0, low=0.0, high=MAX_INTERVAL):
+    """把配置里的秒数转成合法数值，坏值用默认值兜底。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
+
+
 def normalize_profile(raw):
     raw = raw if isinstance(raw, dict) else {}
     profile = {
@@ -234,6 +248,7 @@ def normalize_profile(raw):
                                             or raw.get("right_hold_hotkey"))
                          or DEFAULT_RIGHT_HOTKEY),
         "auto_right_hold": bool(raw.get("auto_right_hold", False)),
+        "cycle_interval": safe_seconds(raw.get("cycle_interval"), 0.0),
         "jitter_enabled": bool(raw.get("jitter_enabled", True)),
         "jitter_min": float(raw.get("jitter_min", DEFAULT_JITTER_MIN) or DEFAULT_JITTER_MIN),
         "jitter_max": float(raw.get("jitter_max", DEFAULT_JITTER_MAX) or DEFAULT_JITTER_MAX),
@@ -484,6 +499,7 @@ class AutoClicker:
         self.jitter_on = True
         self.jitter_min = DEFAULT_JITTER_MIN
         self.jitter_max = DEFAULT_JITTER_MAX
+        self.cycle_interval = 0.0
         self._save_job = None
         self._key_target = None
 
@@ -496,9 +512,9 @@ class AutoClicker:
 
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.root.minsize(640, 660)
+        self.root.minsize(600, 520)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._center_window(680, 720)
+        self._center_window(660, 600)
 
         self._build_ui()
         self._load_profile(self.current_profile)
@@ -536,47 +552,47 @@ class AutoClicker:
         setting_bar.pack(fill=tk.X, padx=8, pady=4)
 
         row1 = ttk.Frame(setting_bar)
-        row1.pack(fill=tk.X, padx=8, pady=(6, 2))
-        ttk.Label(row1, text="启停热键").pack(side=tk.LEFT)
+        row1.pack(fill=tk.X, padx=8, pady=(5, 2))
+        ttk.Label(row1, text="启停").pack(side=tk.LEFT)
         self.hotkey_var = tk.StringVar(value=key_display(self.hotkey))
-        ttk.Label(row1, textvariable=self.hotkey_var, width=12, anchor=tk.CENTER,
-                  relief=tk.SUNKEN).pack(side=tk.LEFT, padx=6)
-        ttk.Button(row1, text="设置热键", width=10, command=self._start_set_hotkey).pack(side=tk.LEFT)
-        ttk.Label(row1, text="默认间隔").pack(side=tk.LEFT, padx=(16, 4))
+        ttk.Label(row1, textvariable=self.hotkey_var, width=8, anchor=tk.CENTER,
+                  relief=tk.SUNKEN).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row1, text="设置", width=6, command=self._start_set_hotkey).pack(side=tk.LEFT)
+        ttk.Label(row1, text="按住右键").pack(side=tk.LEFT, padx=(12, 0))
+        self.right_hotkey_var = tk.StringVar(value=key_display(self.right_hotkey))
+        ttk.Label(row1, textvariable=self.right_hotkey_var, width=8, anchor=tk.CENTER,
+                  relief=tk.SUNKEN).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row1, text="设置", width=6,
+                   command=self._start_set_right_hotkey).pack(side=tk.LEFT)
+        ttk.Label(row1, text="默认间隔").pack(side=tk.LEFT, padx=(12, 3))
         self.default_interval_var = tk.StringVar(value="1")
-        ttk.Entry(row1, textvariable=self.default_interval_var, width=8).pack(side=tk.LEFT)
-        ttk.Label(row1, text="秒（采集时使用）").pack(side=tk.LEFT, padx=4)
+        ttk.Entry(row1, textvariable=self.default_interval_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(row1, text="秒").pack(side=tk.LEFT, padx=2)
 
         row2 = ttk.Frame(setting_bar)
-        row2.pack(fill=tk.X, padx=8, pady=(2, 6))
+        row2.pack(fill=tk.X, padx=8, pady=(2, 5))
         self.jitter_on_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text="间隔随机化", variable=self.jitter_on_var,
+        ttk.Checkbutton(row2, text="随机化", variable=self.jitter_on_var,
                         command=self._on_change).pack(side=tk.LEFT)
-        ttk.Label(row2, text="实际间隔 = 设定值 ×").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Label(row2, text="×").pack(side=tk.LEFT, padx=(6, 2))
         self.jitter_min_var = tk.StringVar(value=str(DEFAULT_JITTER_MIN))
-        ttk.Entry(row2, textvariable=self.jitter_min_var, width=6).pack(side=tk.LEFT)
+        ttk.Entry(row2, textvariable=self.jitter_min_var, width=5).pack(side=tk.LEFT)
         ttk.Label(row2, text="~").pack(side=tk.LEFT, padx=2)
         self.jitter_max_var = tk.StringVar(value=str(DEFAULT_JITTER_MAX))
-        ttk.Entry(row2, textvariable=self.jitter_max_var, width=6).pack(side=tk.LEFT)
-        ttk.Label(row2, text="倍（例：设 0.1 秒 → 实际 0.05~0.2 秒）").pack(side=tk.LEFT, padx=6)
-        for var in (self.jitter_min_var, self.jitter_max_var):
+        ttk.Entry(row2, textvariable=self.jitter_max_var, width=5).pack(side=tk.LEFT)
+        ttk.Label(row2, text="倍").pack(side=tk.LEFT, padx=(2, 14))
+        ttk.Label(row2, text="轮次间隔").pack(side=tk.LEFT)
+        self.cycle_var = tk.StringVar(value="0")
+        ttk.Entry(row2, textvariable=self.cycle_var, width=6).pack(side=tk.LEFT, padx=4)
+        ttk.Label(row2, text="秒（每轮之间等待）").pack(side=tk.LEFT, padx=2)
+        for var in (self.jitter_min_var, self.jitter_max_var, self.cycle_var):
             var.trace_add("write", lambda *_: self._on_change())
-
-        row3 = ttk.Frame(setting_bar)
-        row3.pack(fill=tk.X, padx=8, pady=(2, 6))
-        ttk.Label(row3, text="按住右键热键").pack(side=tk.LEFT)
-        self.right_hotkey_var = tk.StringVar(value=key_display(self.right_hotkey))
-        ttk.Label(row3, textvariable=self.right_hotkey_var, width=12, anchor=tk.CENTER,
-                  relief=tk.SUNKEN).pack(side=tk.LEFT, padx=6)
-        ttk.Button(row3, text="设置热键", width=10,
-                   command=self._start_set_right_hotkey).pack(side=tk.LEFT)
-        ttk.Label(row3, text="随时按此键开关按住右键，与是否在运行无关").pack(side=tk.LEFT, padx=(12, 0))
 
         # 位置列表
         list_bar = ttk.LabelFrame(self.root, text="执行列表")
         list_bar.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         columns = ("index", "type", "name", "detail", "interval")
-        self.tree = ttk.Treeview(list_bar, columns=columns, show="headings", height=11)
+        self.tree = ttk.Treeview(list_bar, columns=columns, show="headings", height=8)
         for key, title, width in (("index", "序号", 50), ("type", "类型", 70),
                                   ("name", "名称", 130), ("detail", "内容", 200),
                                   ("interval", "间隔", 120)):
@@ -608,19 +624,19 @@ class AutoClicker:
             ("下移", self._move_down),
         )
         for text, command in actions:
-            ttk.Button(action_bar, text=text, width=9, command=command).pack(side=tk.LEFT, padx=3)
+            ttk.Button(action_bar, text=text, command=command).pack(side=tk.LEFT, padx=2)
 
         # 执行控制
         control_bar = ttk.Frame(self.root)
         control_bar.pack(fill=tk.X, padx=8, pady=(6, 2))
-        self.btn_start = ttk.Button(control_bar, text="▶ 开始", width=12, command=self._start_clicking)
-        self.btn_start.pack(side=tk.LEFT, padx=4)
-        self.btn_stop = ttk.Button(control_bar, text="⏹ 停止", width=12,
+        self.btn_start = ttk.Button(control_bar, text="▶ 开始", width=10, command=self._start_clicking)
+        self.btn_start.pack(side=tk.LEFT, padx=3)
+        self.btn_stop = ttk.Button(control_bar, text="⏹ 停止", width=10,
                                    command=self._stop_clicking, state=tk.DISABLED)
-        self.btn_stop.pack(side=tk.LEFT, padx=4)
-        self.btn_right = ttk.Button(control_bar, text="按住右键", width=12, command=self._toggle_right_hold)
-        self.btn_right.pack(side=tk.LEFT, padx=4)
-        ttk.Button(control_bar, text="清空列表", width=12, command=self._clear_items).pack(side=tk.LEFT, padx=4)
+        self.btn_stop.pack(side=tk.LEFT, padx=3)
+        self.btn_right = ttk.Button(control_bar, text="按住右键", width=10, command=self._toggle_right_hold)
+        self.btn_right.pack(side=tk.LEFT, padx=3)
+        ttk.Button(control_bar, text="清空列表", width=10, command=self._clear_items).pack(side=tk.LEFT, padx=3)
 
         option_bar = ttk.Frame(self.root)
         option_bar.pack(fill=tk.X, padx=8, pady=(4, 0))
@@ -637,7 +653,11 @@ class AutoClicker:
         # 底部提示
         foot = ttk.Frame(self.root)
         foot.pack(fill=tk.X, padx=8, pady=(0, 8))
-        ttk.Label(foot, text="数据文件：" + CONFIG_PATH, foreground="#666").pack(side=tk.LEFT)
+        if os.path.abspath(os.path.dirname(CONFIG_PATH)) == os.path.abspath(APP_DIR):
+            data_text = "数据文件：" + CONFIG_NAME
+        else:
+            data_text = "数据文件：" + CONFIG_PATH
+        ttk.Label(foot, text=data_text, foreground="#666").pack(side=tk.LEFT)
         if not is_admin():
             ttk.Button(foot, text="以管理员身份重启", command=self._restart_as_admin).pack(side=tk.RIGHT)
         if not HAS_KEYBOARD:
@@ -650,6 +670,7 @@ class AutoClicker:
             "hotkey": self.hotkey,
             "right_hotkey": self.right_hotkey,
             "auto_right_hold": bool(self.auto_right_hold_var.get()),
+            "cycle_interval": self._cycle_value(),
             "jitter_enabled": bool(self.jitter_on_var.get()),
             "jitter_min": self._safe_float(self.jitter_min_var.get(), DEFAULT_JITTER_MIN),
             "jitter_max": self._safe_float(self.jitter_max_var.get(), DEFAULT_JITTER_MAX),
@@ -666,6 +687,7 @@ class AutoClicker:
         self.right_hotkey = profile["right_hotkey"]
         self.right_hotkey_var.set(key_display(self.right_hotkey))
         self.auto_right_hold_var.set(profile["auto_right_hold"])
+        self.cycle_var.set(f"{profile['cycle_interval']:g}")
         self.jitter_on_var.set(profile["jitter_enabled"])
         self.jitter_min_var.set(f"{profile['jitter_min']:g}")
         self.jitter_max_var.set(f"{profile['jitter_max']:g}")
@@ -835,6 +857,15 @@ class AutoClicker:
         self.jitter_on = bool(self.jitter_on_var.get())
         self.jitter_min = self._safe_float(self.jitter_min_var.get(), DEFAULT_JITTER_MIN)
         self.jitter_max = self._safe_float(self.jitter_max_var.get(), DEFAULT_JITTER_MAX)
+        self.cycle_interval = self._cycle_value()
+
+    def _cycle_value(self):
+        """轮次间隔秒数，0 表示不等，填错按 0 处理。"""
+        try:
+            value = parse_interval(str(self.cycle_var.get()).strip())
+        except ValueError:
+            return 0.0
+        return max(0.0, min(MAX_INTERVAL, value))
 
     @staticmethod
     def _safe_float(text, default):
@@ -851,18 +882,56 @@ class AutoClicker:
         return max(MIN_INTERVAL, min(MAX_INTERVAL, value))
 
     # ── 列表操作 ────────────────────────────────────────────────────────────
-    def _describe(self, item):
+    def _resolve_positions(self, items=None):
+        """把相对偏移换算成实际坐标，返回与列表等长的数组（按键项为 None）。
+
+        鼠标项是 (x, y, 是否有参照点)。相对模式下若前面没有鼠标点，就退回按
+        绝对坐标处理，并在列表里标出来。
+        """
+        items = self.items if items is None else items
+        resolved = []
+        last = None
+        for item in items:
+            if item.get("type") != "mouse":
+                resolved.append(None)
+                continue
+            has_ref = True
+            if item.get("mode") == "rel":
+                if last is None:
+                    has_ref = False
+                    point = (int(item.get("x", 0)), int(item.get("y", 0)))
+                else:
+                    point = (last[0] + int(item.get("x", 0)), last[1] + int(item.get("y", 0)))
+            else:
+                point = (int(item.get("x", 0)), int(item.get("y", 0)))
+            last = point
+            resolved.append((point[0], point[1], has_ref))
+        return resolved
+
+    def _describe(self, item, point=None):
         if item.get("type") == "key":
             return f"按键 {key_display(item.get('key', ''))}"
-        return f"点击 ({item.get('x', 0)}, {item.get('y', 0)})"
+        if point is None:
+            point = (item.get("x", 0), item.get("y", 0))
+        return f"点击 ({point[0]}, {point[1]})"
 
     def _refresh_list(self):
+        points = self._resolve_positions()
         self.tree.delete(*self.tree.get_children())
         for position, item in enumerate(self.items, 1):
             kind = "键盘" if item.get("type") == "key" else "鼠标"
+            point = points[position - 1]
+            if item.get("type") != "mouse":
+                detail = self._describe(item)
+            elif item.get("mode") == "rel":
+                offset = f"{int(item.get('x', 0)):+d},{int(item.get('y', 0)):+d}"
+                detail = (f"偏移 {offset}｜前面没有参照点" if not point[2]
+                          else f"偏移 {offset} → ({point[0]}, {point[1]})")
+            else:
+                detail = f"({point[0]}, {point[1]})"
             self.tree.insert("", tk.END, iid=str(position - 1),
                              values=(position, kind, item.get("name", ""),
-                                     self._describe(item),
+                                     detail,
                                      format_interval(item.get("interval", 1.0))))
 
     def _selected_index(self):
@@ -933,7 +1002,7 @@ class AutoClicker:
             current = dict(self.items[index])
         else:
             cursor_x, cursor_y = get_cursor_pos()
-            current = {"type": "mouse", "name": "",
+            current = {"type": "mouse", "name": "", "mode": "abs",
                        "x": cursor_x, "y": cursor_y, "key": "space",
                        "interval": self._default_interval()}
 
@@ -966,12 +1035,40 @@ class AutoClicker:
 
         mouse_frame = ttk.Frame(body)
         mouse_frame.grid(row=2, column=0, columnspan=3, sticky=tk.W)
-        ttk.Label(mouse_frame, text="X").pack(side=tk.LEFT)
-        ttk.Entry(mouse_frame, textvariable=x_var, width=9).pack(side=tk.LEFT, padx=4)
-        ttk.Label(mouse_frame, text="Y").pack(side=tk.LEFT)
-        ttk.Entry(mouse_frame, textvariable=y_var, width=9).pack(side=tk.LEFT, padx=4)
-        ttk.Button(mouse_frame, text="取当前鼠标位置", width=16,
-                   command=lambda: self._fill_cursor(x_var, y_var)).pack(side=tk.LEFT, padx=8)
+
+        mode_var = tk.StringVar(value=current.get("mode", "abs"))
+        mode_row = ttk.Frame(mouse_frame)
+        mode_row.pack(anchor=tk.W)
+        ttk.Label(mode_row, text="位置").pack(side=tk.LEFT)
+        ttk.Radiobutton(mode_row, text="绝对坐标", value="abs",
+                        variable=mode_var).pack(side=tk.LEFT, padx=6)
+        ttk.Radiobutton(mode_row, text="相对上一个鼠标点", value="rel",
+                        variable=mode_var).pack(side=tk.LEFT)
+
+        coord_row = ttk.Frame(mouse_frame)
+        coord_row.pack(anchor=tk.W, pady=(4, 0))
+        x_label = ttk.Label(coord_row, text="X")
+        x_label.pack(side=tk.LEFT)
+        ttk.Entry(coord_row, textvariable=x_var, width=9).pack(side=tk.LEFT, padx=4)
+        y_label = ttk.Label(coord_row, text="Y")
+        y_label.pack(side=tk.LEFT)
+        ttk.Entry(coord_row, textvariable=y_var, width=9).pack(side=tk.LEFT, padx=4)
+        mode_button = ttk.Button(coord_row, text="取当前鼠标位置", width=16,
+                                 command=lambda: self._fill_cursor(x_var, y_var))
+        mode_button.pack(side=tk.LEFT, padx=8)
+
+        mode_hint = tk.StringVar()
+        ttk.Label(mouse_frame, textvariable=mode_hint, foreground="#666").pack(anchor=tk.W)
+
+        def sync_mode(*_):
+            relative = mode_var.get() == "rel"
+            x_label.config(text="偏移 X" if relative else "X")
+            y_label.config(text="偏移 Y" if relative else "Y")
+            mode_button.config(state=tk.DISABLED if relative else tk.NORMAL)
+            mode_hint.set(f"相对列表里上一个鼠标点击，填偏移像素，范围 ±{MAX_OFFSET}"
+                          if relative else "屏幕绝对坐标")
+        mode_var.trace_add("write", sync_mode)
+        sync_mode()
 
         key_frame = ttk.Frame(body)
         key_frame.grid(row=3, column=0, columnspan=3, sticky=tk.W)
@@ -1007,6 +1104,9 @@ class AutoClicker:
                 except ValueError:
                     error_var.set("X / Y 必须是数字。")
                     return
+                if mode_var.get() == "rel" and max(abs(x_value), abs(y_value)) > MAX_OFFSET:
+                    error_var.set(f"偏移量请控制在 ±{MAX_OFFSET} 像素以内。")
+                    return
             else:
                 if not key_holder["name"]:
                     error_var.set("请先绑定一个按键。")
@@ -1028,6 +1128,7 @@ class AutoClicker:
             if type_var.get() == "mouse":
                 item["x"] = x_value
                 item["y"] = y_value
+                item["mode"] = mode_var.get()
             else:
                 item["key"] = key_holder["name"]
             if editing:
@@ -1060,6 +1161,7 @@ class AutoClicker:
                 "name": f"点击{len(self.items) + 1}",
                 "x": x_value,
                 "y": y_value,
+                "mode": "abs",
                 "interval": self._default_interval(),
             })
             self._refresh_list()
@@ -1278,16 +1380,26 @@ class AutoClicker:
         self.status_var.set("已停止")
 
     def _click_loop(self):
+        """循环执行的入口：不管中间出什么意外，都要复位状态并通知界面。"""
+        try:
+            self._click_rounds()
+        finally:
+            self.running = False
+            self.ui_queue.put(("stopped", None))
+
+    def _click_rounds(self):
         while self.running:
             snapshot = [dict(item) for item in self.items]
             if not snapshot:
                 break
+            points = self._resolve_positions(snapshot)
             for position, item in enumerate(snapshot, 1):
                 if not self.running:
                     break
-                self._set_status(f"第 {position}/{len(snapshot)} 项：{self._describe(item)}")
+                point = points[position - 1]
+                self._set_status(f"第 {position}/{len(snapshot)} 项：{self._describe(item, point)}")
                 if item.get("type") == "mouse":
-                    mouse_click_left(item.get("x", 0), item.get("y", 0))
+                    mouse_click_left(point[0], point[1])
                 else:
                     if not key_tap(item.get("key", "")):
                         self._set_status(f"按键 {key_display(item.get('key', ''))} 执行失败")
@@ -1296,8 +1408,11 @@ class AutoClicker:
                 delay = self._calc_delay(item.get("interval", 1.0))
                 self._set_status(f"第 {position} 项完成，随机等待 {format_seconds(delay)}")
                 self._sleep_interruptible(delay)
-        self.running = False
-        self.ui_queue.put(("stopped", None))
+            # 一轮跑完后的轮次间隔
+            if self.running and self.cycle_interval > 0:
+                delay = self._calc_delay(self.cycle_interval)
+                self._set_status(f"本轮结束，等待 {format_seconds(delay)}")
+                self._sleep_interruptible(delay)
 
     def _sleep_interruptible(self, seconds):
         end = time.time() + max(0.0, seconds)

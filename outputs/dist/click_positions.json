@@ -1,113 +1,466 @@
 {
   "version": 2,
-  "current_profile": "清卡机-卡槽二 0.1版本",
+  "current_profile": "卡槽1",
   "profiles": {
-    "生化": {
-      "hotkey": "down",
+    "默认方案": {
+      "hotkey": "f12",
       "right_hotkey": "f8",
       "auto_right_hold": false,
+      "cycle_interval": 0.0,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
       "items": []
+    },
+    "生化": {
+      "hotkey": "down",
+      "right_hotkey": "f8",
+      "auto_right_hold": false,
+      "cycle_interval": 0.0,
+      "jitter_enabled": true,
+      "jitter_min": 0.5,
+      "jitter_max": 2.0,
+      "items": [
+        {
+          "type": "mouse",
+          "name": "按钮1",
+          "interval": 2.0,
+          "x": 1340,
+          "y": 742,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮2",
+          "interval": 2.0,
+          "x": 998,
+          "y": 814,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮3",
+          "interval": 2.0,
+          "x": 1138,
+          "y": 796,
+          "mode": "abs"
+        }
+      ]
     },
     "常规": {
       "hotkey": "down",
       "right_hotkey": "f8",
       "auto_right_hold": false,
+      "cycle_interval": 0.0,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
-      "items": []
+      "items": [
+        {
+          "type": "mouse",
+          "name": "匹配",
+          "interval": 2.0,
+          "x": 1314,
+          "y": 741,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "确定1",
+          "interval": 2.0,
+          "x": 920,
+          "y": 828,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "确定2",
+          "interval": 2.0,
+          "x": 1134,
+          "y": 798,
+          "mode": "abs"
+        }
+      ]
     },
     "生化速刷": {
       "hotkey": "down",
       "right_hotkey": "f8",
       "auto_right_hold": false,
+      "cycle_interval": 0.0,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
-      "items": []
+      "items": [
+        {
+          "type": "mouse",
+          "name": "加入游戏",
+          "interval": 1.0,
+          "x": 1389,
+          "y": 746,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "战绩确定",
+          "interval": 1.0,
+          "x": 1410,
+          "y": 887,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "关闭推荐",
+          "interval": 1.0,
+          "x": 973,
+          "y": 837,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "关闭任务",
+          "interval": 1.0,
+          "x": 1020,
+          "y": 698,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "确定",
+          "interval": 1.0,
+          "x": 961,
+          "y": 645,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "称号确认",
+          "interval": 1.0,
+          "x": 1089,
+          "y": 893,
+          "mode": "abs"
+        }
+      ]
     },
     "生化速刷1": {
       "hotkey": "down",
       "right_hotkey": "f8",
       "auto_right_hold": false,
+      "cycle_interval": 0.0,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
-      "items": []
+      "items": [
+        {
+          "type": "mouse",
+          "name": "加入游戏",
+          "interval": 1.0,
+          "x": 1331,
+          "y": 702,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "战绩确定",
+          "interval": 1.0,
+          "x": 1303,
+          "y": 810,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "关闭任务",
+          "interval": 1.0,
+          "x": 995,
+          "y": 651,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮4",
+          "interval": 1.0,
+          "x": 943,
+          "y": 761,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮5",
+          "interval": 1.0,
+          "x": 988,
+          "y": 604,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮6",
+          "interval": 1.0,
+          "x": 936,
+          "y": 625,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮7",
+          "interval": 2.0,
+          "x": 984,
+          "y": 661,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮8",
+          "interval": 2.0,
+          "x": 961,
+          "y": 777,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "点击9",
+          "interval": 1.0,
+          "x": 1026,
+          "y": 694,
+          "mode": "abs"
+        }
+      ]
     },
     "挑战": {
       "hotkey": "down",
       "right_hotkey": "f8",
       "auto_right_hold": false,
+      "cycle_interval": 0.0,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
-      "items": []
-    },
-    "方案7": {
-      "hotkey": "down",
-      "right_hotkey": "f8",
-      "auto_right_hold": false,
-      "jitter_enabled": true,
-      "jitter_min": 0.5,
-      "jitter_max": 2.0,
-      "items": []
+      "items": [
+        {
+          "type": "mouse",
+          "name": "按钮1",
+          "interval": 2.0,
+          "x": 1429,
+          "y": 738,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮2",
+          "interval": 2.0,
+          "x": 909,
+          "y": 885,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮3",
+          "interval": 2.0,
+          "x": 1335,
+          "y": 887,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮4",
+          "interval": 2.0,
+          "x": 1295,
+          "y": 865,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮5",
+          "interval": 2.0,
+          "x": 999,
+          "y": 627,
+          "mode": "abs"
+        }
+      ]
     },
     "1360x768生化速刷": {
       "hotkey": "down",
       "right_hotkey": "f8",
       "auto_right_hold": false,
+      "cycle_interval": 0.0,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
-      "items": []
+      "items": [
+        {
+          "type": "mouse",
+          "name": "按钮1",
+          "interval": 2.0,
+          "x": 1521,
+          "y": 745,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮2",
+          "interval": 2.0,
+          "x": 1524,
+          "y": 877,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮3",
+          "interval": 2.0,
+          "x": 839,
+          "y": 636,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮4",
+          "interval": 2.0,
+          "x": 1013,
+          "y": 681,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮5",
+          "interval": 2.0,
+          "x": 869,
+          "y": 828,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮6",
+          "interval": 2.0,
+          "x": 974,
+          "y": 845,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "按钮7",
+          "interval": 2.0,
+          "x": 1004,
+          "y": 692,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "点击8",
+          "interval": 1.0,
+          "x": 1030,
+          "y": 666,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "点击9",
+          "interval": 1.0,
+          "x": 943,
+          "y": 640,
+          "mode": "abs"
+        }
+      ]
     },
-    "清卡机-卡槽一 0.1版本": {
+    "卡槽1": {
       "hotkey": "up",
-      "right_hotkey": "f8",
+      "right_hotkey": "left",
       "auto_right_hold": false,
+      "cycle_interval": 0.5,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 1.5,
       "items": [
         {
+          "type": "key",
+          "name": "E",
+          "interval": 0.2,
+          "key": "e"
+        },
+        {
           "type": "mouse",
-          "name": "点击1",
-          "interval": 0.1,
-          "x": 831,
-          "y": 560
+          "name": "选卡",
+          "interval": 0.2,
+          "x": 727,
+          "y": 582,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "放卡",
+          "interval": 0.2,
+          "x": 1242,
+          "y": 756,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "奖励确认",
+          "interval": 0.2,
+          "x": 963,
+          "y": 734,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "点击6",
+          "interval": 0.2,
+          "x": 1140,
+          "y": 615,
+          "mode": "abs"
         }
       ]
     },
-    "清卡机-卡槽二 0.1版本": {
+    "卡槽2": {
       "hotkey": "right",
-      "right_hotkey": "f8",
+      "right_hotkey": "down",
       "auto_right_hold": false,
+      "cycle_interval": 1.5,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,
-      "items": []
-    },
-    "清卡机-卡槽三 0.1版本": {
-      "hotkey": "right",
-      "right_hotkey": "f8",
-      "auto_right_hold": false,
-      "jitter_enabled": true,
-      "jitter_min": 0.5,
-      "jitter_max": 2.0,
-      "items": []
-    },
-    "清卡机-卡槽二 3s版本": {
-      "hotkey": "up",
-      "right_hotkey": "f8",
-      "auto_right_hold": false,
-      "jitter_enabled": true,
-      "jitter_min": 0.5,
-      "jitter_max": 2.0,
-      "items": []
+      "items": [
+        {
+          "type": "key",
+          "name": "E",
+          "interval": 0.2,
+          "key": "e"
+        },
+        {
+          "type": "mouse",
+          "name": "选卡",
+          "interval": 0.2,
+          "x": 867,
+          "y": 582,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "放卡",
+          "interval": 0.2,
+          "x": 1242,
+          "y": 756,
+          "mode": "abs"
+        },
+        {
+          "type": "mouse",
+          "name": "奖励确认",
+          "interval": 0.2,
+          "x": 963,
+          "y": 734,
+          "mode": "abs"
+        },
+        {
+          "type": "key",
+          "name": "F",
+          "interval": 0.2,
+          "key": "f"
+        },
+        {
+          "type": "mouse",
+          "name": "点击6",
+          "interval": 0.2,
+          "x": 1140,
+          "y": 615,
+          "mode": "abs"
+        }
+      ]
     }
   }
 }

@@ -31,37 +31,93 @@ import time
 # 因此这里把自带的 Tcl/Tk 运行库释放到固定目录，并切换到该目录。
 # 必须在 import tkinter 之前执行。
 def bootstrap_tcl_tk():
+    """打包后 Tcl/Tk 运行库引导：确保 DLL 和脚本版本一致。"""
     if not getattr(sys, "frozen", False):
         return None
     bundle = getattr(sys, "_MEIPASS", None)
     if not bundle:
         return None
+
+    # 清除系统可能残留的旧路径，避免版本冲突
     os.environ.pop("TCL_LIBRARY", None)
     os.environ.pop("TK_LIBRARY", None)
 
+    # 从 DLLs 目录获取 Tcl/Tk DLL 的实际版本号，然后精确匹配同版本的脚本
+    dlls_dir = os.path.join(bundle, "DLLs")
+    tcl_dll = os.path.join(dlls_dir, "tcl86t.dll") if os.path.isdir(dlls_dir) else None
+    tk_dll = os.path.join(dlls_dir, "tk86t.dll") if tcl_dll and os.path.isfile(tcl_dll) else None
+
+    # 候选路径：exe 同级 runtime、LOCALAPPDATA、bundle 自身
     exe_dir = os.path.dirname(os.path.abspath(sys.executable))
     local_app = os.environ.get("LOCALAPPDATA")
-    candidates = [exe_dir]
+    candidates = []
     if local_app:
-        candidates.append(os.path.join(local_app, "AutoClicker"))
+        candidates.append(os.path.join(local_app, "AutoClicker", "runtime"))
+    candidates.append(os.path.join(exe_dir, "runtime"))
     candidates.append(bundle)
 
-    for folder in candidates:
-        runtime = folder if folder == bundle else os.path.join(folder, "runtime")
-        marker = os.path.join(runtime, "tcl", "tcl8.6", "init.tcl")
-        try:
-            if not os.path.isfile(marker):
+    for runtime in candidates:
+        tcl_dir = os.path.join(runtime, "tcl", "tcl8.6")
+        tk_dir = os.path.join(runtime, "tk", "tk8.6")
+        marker = os.path.join(tcl_dir, "init.tcl")
+        if not os.path.isfile(marker):
+            # 从 bundle 复制
+            try:
                 copy_tree(os.path.join(bundle, "tcl"), os.path.join(runtime, "tcl"))
                 copy_tree(os.path.join(bundle, "tk"), os.path.join(runtime, "tk"))
-            if not os.path.isfile(marker):
+            except Exception:
                 continue
-            os.chdir(runtime)
-            os.environ["TCL_LIBRARY"] = os.path.join("tcl", "tcl8.6")
-            os.environ["TK_LIBRARY"] = os.path.join("tk", "tk8.6")
-            return runtime
-        except Exception:
+        if not os.path.isfile(marker):
             continue
-    return None
+
+        # 读 init.tcl 确认版本号，只用版本匹配的 DLL
+        try:
+            with open(marker, "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if "package require -exact Tcl" in line:
+                        ver = line.split()[-1].strip()
+                        # 检查 DLLs 目录中是否有对应版本的 DLL
+                        if tcl_dll and os.path.isfile(tcl_dll):
+                            # DLL 已通过 PyInstaller 打包，直接用
+                            pass
+                        break
+        except Exception:
+            pass
+
+        os.chdir(runtime)
+        os.environ["TCL_LIBRARY"] = os.path.join(runtime, "tcl", "tcl8.6")
+        os.environ["TK_LIBRARY"] = os.path.join(runtime, "tk", "tk8.6")
+        return runtime
+
+    # 兜底：直接用 bundle 路径
+    os.environ["TCL_LIBRARY"] = os.path.join(bundle, "tcl", "tcl8.6")
+    os.environ["TK_LIBRARY"] = os.path.join(bundle, "tk", "tk8.6")
+    try:
+        os.chdir(bundle)
+    except Exception:
+        pass
+    return bundle
+
+
+def _ensure_dll_path():
+    """确保 Tcl/Tk DLL 从打包目录加载，不被系统旧版覆盖。"""
+    if not getattr(sys, "frozen", False):
+        return
+    bundle = getattr(sys, "_MEIPASS", None)
+    if not bundle:
+        return
+    # 将 bundle 根目录加入 DLL 搜索路径最前面
+    try:
+        os.add_dll_directory(bundle)
+    except AttributeError:
+        pass
+    # 也加入 DLLs 子目录
+    dlls_dir = os.path.join(bundle, "DLLs")
+    if os.path.isdir(dlls_dir):
+        try:
+            os.add_dll_directory(dlls_dir)
+        except AttributeError:
+            pass
 
 
 def copy_tree(source, target):
@@ -80,6 +136,7 @@ def copy_tree(source, target):
 
 
 TCL_RUNTIME = bootstrap_tcl_tk()
+_ensure_dll_path()
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -95,7 +152,7 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v25"
+APP_VERSION = "v23"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -113,34 +170,60 @@ MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 
-# --- SendInput structures (replaces mouse_event, harder to detect) ---
+# --- SendInput ---
 INPUT_MOUSE = 0
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_WHEEL = 0x0800
+
+# --- Raw Input (兼容游戏的鼠标输入捕获) ---
+RIM_TYPEMOUSE = 0
+WM_INPUT = 0x00FF
+RID_INPUT = 0x10000003
+RIDEV_INPUTSINK = 0x00000100
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [("dwType", ctypes.wintypes.DWORD), ("dwSize", ctypes.wintypes.DWORD),
+                ("hDevice", ctypes.wintypes.HANDLE), ("wParam", ctypes.wintypes.WPARAM)]
+
+class RAWMOUSE(ctypes.Structure):
+    _fields_ = [("usFlags", ctypes.c_ushort), ("usButtonFlags", ctypes.c_ushort),
+                ("usButtonData", ctypes.c_ushort), ("ulRawButtons", ctypes.c_ulong),
+                ("lLastX", ctypes.c_long), ("lLastY", ctypes.c_long),
+                ("ulExtraInformation", ctypes.c_ulong)]
+
+class RAWINPUT(ctypes.Structure):
+    _fields_ = [("header", RAWINPUTHEADER), ("mouse", RAWMOUSE)]
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [("usUsagePage", ctypes.c_ushort), ("usUsage", ctypes.c_ushort),
+                ("dwFlags", ctypes.wintypes.DWORD), ("hwndTarget", ctypes.wintypes.HWND)]
+
+RegisterRawInputDevices = user32.RegisterRawInputDevices
+GetRawInputData = user32.GetRawInputData
 
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [
-        ('dx', ctypes.wintypes.LONG),
-        ('dy', ctypes.wintypes.LONG),
-        ('mouseData', ctypes.wintypes.DWORD),
-        ('dwFlags', ctypes.wintypes.DWORD),
-        ('time', ctypes.wintypes.DWORD),
-        ('dwExtraInfo', ctypes.POINTER(ctypes.c_ulong)),
+        ("dx", ctypes.wintypes.LONG),
+        ("dy", ctypes.wintypes.LONG),
+        ("mouseData", ctypes.wintypes.DWORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("time", ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
     ]
 
 class _INPUT_UNION(ctypes.Union):
-    _fields_ = [('mi', MOUSEINPUT)]
+    _fields_ = [("mi", MOUSEINPUT)]
 
 class INPUT(ctypes.Structure):
     _fields_ = [
-        ('type', ctypes.wintypes.DWORD),
-        ('union', _INPUT_UNION),
+        ("type", ctypes.wintypes.DWORD),
+        ("union", _INPUT_UNION),
     ]
 
 SendInput = user32.SendInput
 SendInput.argtypes = [ctypes.wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 SendInput.restype = ctypes.wintypes.UINT
-
 
 def _send_mouse_input(flags, dx=0, dy=0, data=0):
     inp = INPUT()
@@ -153,55 +236,34 @@ def _send_mouse_input(flags, dx=0, dy=0, data=0):
     inp.union.mi.dwExtraInfo = ctypes.pointer(ctypes.c_ulong(0))
     SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
-
 def _bezier_curve(p0, p1, p2, p3, steps):
     points = []
     for i in range(steps + 1):
-        t = i / steps
-        u = 1 - t
-        x = u**3 * p0[0] + 3 * u**2 * t * p1[0] + 3 * u * t**2 * p2[0] + t**3 * p3[0]
-        y = u**3 * p0[1] + 3 * u**2 * t * p1[1] + 3 * u * t**2 * p2[1] + t**3 * p3[1]
+        t = i / steps; u = 1 - t
+        x = u**3*p0[0]+3*u**2*t*p1[0]+3*u*t**2*p2[0]+t**3*p3[0]
+        y = u**3*p0[1]+3*u**2*t*p1[1]+3*u*t**2*p2[1]+t**3*p3[1]
         points.append((int(x), int(y)))
     return points
 
-
-def _pixel_to_abs(x, y):
-    """将像素坐标转换为 SendInput 绝一坐标 (0-65535)。"""
-    sw = user32.GetSystemMetrics(0)  # SM_CXSCREEN
-    sh = user32.GetSystemMetrics(1)  # SM_CYSCREEN
-    if sw <= 0: sw = 1920
-    if sh <= 0: sh = 1080
-    return int(x * 65535 / sw), int(y * 65535 / sh)
-
-
 def human_move_to(target_x, target_y, duration=None):
-    """贝塞尔曲线移动鼠标到目标像素坐标，SendInput 内部自动归一化。"""
     cur_x, cur_y = get_cursor_pos()
-    dist = ((target_x - cur_x)**2 + (target_y - cur_y)**2) ** 0.5
-    if dist < 2:
-        return
+    dist = ((target_x-cur_x)**2+(target_y-cur_y)**2)**0.5
+    if dist < 2: return
     if duration is None:
-        duration = min(0.4, max(0.08, dist / 2500.0)) + random.uniform(-0.03, 0.05)
+        duration = min(0.4, max(0.08, dist/2500.0))+random.uniform(-0.03,0.05)
     duration = max(0.04, duration)
-    ctrl1_x = cur_x + (target_x - cur_x) * random.uniform(0.2, 0.4) + random.uniform(-20, 20)
-    ctrl1_y = cur_y + (target_y - cur_y) * random.uniform(0.1, 0.3) + random.uniform(-20, 20)
-    ctrl2_x = cur_x + (target_x - cur_x) * random.uniform(0.6, 0.8) + random.uniform(-15, 15)
-    ctrl2_y = cur_y + (target_y - cur_y) * random.uniform(0.7, 0.9) + random.uniform(-15, 15)
-    steps = max(5, int(dist / 3))
-    curve = _bezier_curve(
-        (cur_x, cur_y), (ctrl1_x, ctrl1_y),
-        (ctrl2_x, ctrl2_y), (target_x, target_y), steps
-    )
-    interval = duration / len(curve)
-    for i, (px, py) in enumerate(curve):
-        if i > len(curve) * 0.7:
-            px += random.uniform(-1, 1)
-            py += random.uniform(-1, 1)
-        ax, ay = _pixel_to_abs(px, py)
-        _send_mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, dx=ax, dy=ay)
-        time.sleep(interval * random.uniform(0.8, 1.2))
-    ax, ay = _pixel_to_abs(target_x, target_y)
-    _send_mouse_input(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, dx=ax, dy=ay)
+    c1x=cur_x+(target_x-cur_x)*random.uniform(0.2,0.4)+random.uniform(-20,20)
+    c1y=cur_y+(target_y-cur_y)*random.uniform(0.1,0.3)+random.uniform(-20,20)
+    c2x=cur_x+(target_x-cur_x)*random.uniform(0.6,0.8)+random.uniform(-15,15)
+    c2y=cur_y+(target_y-cur_y)*random.uniform(0.7,0.9)+random.uniform(-15,15)
+    steps=max(5,int(dist/3))
+    curve=_bezier_curve((cur_x,cur_y),(c1x,c1y),(c2x,c2y),(target_x,target_y),steps)
+    interval=duration/len(curve)
+    for i,(px,py) in enumerate(curve):
+        if i>len(curve)*0.7: px+=random.uniform(-1,1); py+=random.uniform(-1,1)
+        _send_mouse_input(MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE,dx=px,dy=py)
+        time.sleep(interval*random.uniform(0.8,1.2))
+    _send_mouse_input(MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE,dx=target_x,dy=target_y)
 
 
 
@@ -520,16 +582,15 @@ def get_cursor_pos():
 
 
 def mouse_click_left(x, y):
-    """贝塞尔曲线移动 + SendInput + 微偏移，模拟真人点击。"""
+    """Bezier + SendInput."""
     offset_x = random.uniform(-2, 2)
     offset_y = random.uniform(-2, 2)
-    target_x = int(x + offset_x)
-    target_y = int(y + offset_y)
-    human_move_to(target_x, target_y)
+    human_move_to(int(x + offset_x), int(y + offset_y))
     time.sleep(random.uniform(0.01, 0.03))
     _send_mouse_input(MOUSEEVENTF_LEFTDOWN)
     time.sleep(random.uniform(0.04, 0.08))
     _send_mouse_input(MOUSEEVENTF_LEFTUP)
+    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
 
 def mouse_right_down():
@@ -599,6 +660,14 @@ class AutoClicker:
         self._key_target = None
 
         self.running = False
+
+        # Rotation
+        self.rotate_calibrating = False
+        self._rotate_calib_total = 0
+        self._rotate_calib_prev = None
+        self.rotate_sensitivity = 0
+        self._rotate_hotkey_name = "f8"
+        self._rotate_hotkey_handle = None
         self.click_thread = None
         self.right_held = False
         self.right_thread = None
@@ -607,14 +676,15 @@ class AutoClicker:
 
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.root.minsize(600, 520)
+        self.root.minsize(600, 680)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._center_window(660, 600)
+        self._center_window(660, 780)
 
         self._build_ui()
         self._load_profile(self.current_profile)
         self._register_hotkey()
         self._save_now()
+        self._load_rotate_calibration()
         self.root.after(60, self._pump_queue)
 
     def _center_window(self, width, height):
@@ -732,6 +802,20 @@ class AutoClicker:
         self.btn_right = ttk.Button(control_bar, text="按住右键", width=10, command=self._toggle_right_hold)
         self.btn_right.pack(side=tk.LEFT, padx=3)
         ttk.Button(control_bar, text="清空列表", width=10, command=self._clear_items).pack(side=tk.LEFT, padx=3)
+
+        # Rotation panel
+        rotate_bar = ttk.LabelFrame(self.root, text="\u89c6\u89d2\u8f6c\u52a8")
+        rotate_bar.pack(fill=tk.X, padx=8, pady=(4, 2))
+        rotate_row1 = ttk.Frame(rotate_bar)
+        rotate_row1.pack(fill=tk.X, padx=6, pady=(4, 2))
+        self.rotate_sens_label = ttk.Label(rotate_row1, text="\u672a\u6821\u51c6", width=20)
+        self.rotate_sens_label.pack(side=tk.LEFT, padx=4)
+        ttk.Button(rotate_row1, text="\u6821\u51c6180\u00b0", width=12, command=self._start_rotate_calibration).pack(side=tk.LEFT, padx=3)
+        ttk.Button(rotate_row1, text="\u91cd\u7f6e", width=8, command=self._reset_rotate_calibration).pack(side=tk.LEFT, padx=3)
+        ttk.Label(rotate_row1, text="\u89d2\u5ea6\uff1a").pack(side=tk.LEFT, padx=(12, 0))
+        self.rotate_angle_var = tk.StringVar(value="180")
+        ttk.Combobox(rotate_row1, textvariable=self.rotate_angle_var, values=["90", "180", "360"], width=6, state="readonly").pack(side=tk.LEFT, padx=4)
+        ttk.Button(rotate_row1, text="\u8f6c\u52a8", width=8, command=self._do_rotate).pack(side=tk.LEFT, padx=(12, 3))
 
         option_bar = ttk.Frame(self.root)
         option_bar.pack(fill=tk.X, padx=8, pady=(4, 0))
@@ -1387,6 +1471,8 @@ class AutoClicker:
                 self.right_hotkey_handle = None
                 self.status_var.set(f"热键 {key_display(self.right_hotkey)} 注册失败：{exc}")
 
+        self._register_rotate_hotkey()
+
     def _unregister_hotkey(self):
         if keyboard is not None:
             for handle in (self.hotkey_handle, self.right_hotkey_handle):
@@ -1431,6 +1517,8 @@ class AutoClicker:
             self.status_var.set("已停止")
         elif kind == "error":
             messagebox.showerror(APP_NAME, message[1], parent=self.root)
+        elif kind == "rotate":
+            self._do_rotate()
         elif kind == "key":
             self._handle_key_captured(message[1], message[2])
 
@@ -1532,10 +1620,10 @@ class AutoClicker:
         self.status_var.set("右键已按住（点按钮或按热键松开）")
 
     def _right_hold_loop(self):
-        # 随机间隔重发按下信号，消除固定频率特征
         while self.right_held:
             mouse_right_down()
             time.sleep(random.uniform(0.03, 0.08))
+            time.sleep(0.05)
 
     def _release_right(self):
         if not self.right_held:
@@ -1554,9 +1642,134 @@ class AutoClicker:
         else:
             messagebox.showerror(APP_NAME, "提权失败，请右键以管理员身份运行。", parent=self.root)
 
+    # --- Rotation ---
+    def _load_rotate_calibration(self):
+        try:
+            path = os.path.join(APP_DIR, "rotate_calibration.json")
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.rotate_sensitivity = int(data.get("sensitivity", 0))
+                if self.rotate_sensitivity > 0:
+                    self.rotate_sens_label.config(text=f"\u6821\u51c6\u503c: {self.rotate_sensitivity} \u50cf\u7d20/180\u00b0")
+        except Exception:
+            pass
+
+    def _save_rotate_calibration(self):
+        try:
+            path = os.path.join(APP_DIR, "rotate_calibration.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"sensitivity": self.rotate_sensitivity}, f)
+        except Exception:
+            pass
+
+    def _start_rotate_calibration(self):
+        if self.rotate_calibrating: return
+        messagebox.showinfo("\u6821\u51c6", "\u70b9\u51fb\u786e\u5b9a\u540e\uff0c\u8bf7\u7528\u9f20\u6807\u5411\u53f3\u8f6c\u52a8\u89c6\u89d2 180 \u5ea6\u3002\n\u8f6c\u5b8c\u540e\u6309\u4efb\u610f\u952e\u505c\u6b62\u3002", parent=self.root)
+        self.rotate_calibrating = True
+        self._rotate_calib_total = 0
+        self._rotate_calib_prev = None
+        self.rotate_sens_label.config(text="\u6821\u51c6\u4e2d...")
+        threading.Thread(target=self._calib_poll_worker, daemon=True).start()
+        if keyboard is not None:
+            self._rotate_kb_hook = keyboard.hook(self._on_rotate_calib_key)
+
+    def _calib_poll_worker(self):
+        # 通过 Raw Input 捕获鼠标增量（兼容游戏 Raw Input 模式）
+        wc = type('WNDCLASS', (ctypes.Structure,), {
+            '_fields_': [('style', ctypes.wintypes.UINT), ('lpfnWndProc', ctypes.c_void_p),
+                         ('cbClsExtra', ctypes.c_int), ('cbWndExtra', ctypes.c_int),
+                         ('hInstance', ctypes.wintypes.HINSTANCE), ('hIcon', ctypes.wintypes.HANDLE),
+                         ('hCursor', ctypes.wintypes.HANDLE), ('hbrBackground', ctypes.wintypes.HANDLE),
+                         ('lpszMenuName', ctypes.wintypes.LPCWSTR), ('lpszClassName', ctypes.wintypes.LPCWSTR)]
+        })()
+        wc.lpfnWndProc = ctypes.cast(user32.DefWindowProcW, ctypes.c_void_p)
+        wc.lpszClassName = "RawInputCalib"
+        wc.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+        atom = user32.RegisterClassW(ctypes.byref(wc))
+        hwnd = user32.CreateWindowExW(0, "RawInputCalib", "Calib", 0, 0, 0, 1, 1, None, None, wc.hInstance, None)
+        if not hwnd:
+            self.rotate_calibrating = False
+            return
+        rid = RAWINPUTDEVICE()
+        rid.usUsagePage = 1; rid.usUsage = 2; rid.dwFlags = RIDEV_INPUTSINK; rid.hwndTarget = hwnd
+        RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE))
+        raw_size = ctypes.sizeof(RAWINPUT)
+        buf = ctypes.create_string_buffer(raw_size * 2)
+        msg = ctypes.wintypes.MSG()
+        while self.rotate_calibrating:
+            if user32.PeekMessageW(ctypes.byref(msg), hwnd, 0, 0, 1):
+                if msg.message == WM_INPUT:
+                    size = ctypes.wintypes.UINT(raw_size * 2)
+                    GetRawInputData(msg.lParam, RID_INPUT, ctypes.byref(buf), ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER))
+                    raw = ctypes.cast(ctypes.byref(buf), ctypes.POINTER(RAWINPUT)).contents
+                    if raw.header.dwType == RIM_TYPEMOUSE:
+                        self._rotate_calib_total += abs(raw.mouse.lLastX)
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+            else:
+                time.sleep(0.001)
+        rid.dwFlags = 1; rid.usUsagePage = 1; rid.usUsage = 2
+        RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE))
+        user32.DestroyWindow(hwnd)
+        user32.UnregisterClassW("RawInputCalib", wc.hInstance)
+
+    def _on_rotate_calib_key(self, event):
+        if not self.rotate_calibrating: return
+        self.rotate_calibrating = False
+        if keyboard is not None:
+            try: keyboard.unhook(self._rotate_kb_hook)
+            except: pass
+        total_dx = self._rotate_calib_total
+        if total_dx < 10:
+            messagebox.showwarning("\u6821\u51c6", "\u79fb\u52a8\u8ddd\u79bb\u592a\u77ed\uff0c\u8bf7\u91cd\u8bd5\u3002", parent=self.root)
+            self.rotate_sens_label.config(text="\u672a\u6821\u51c6")
+            return
+        self.rotate_sensitivity = total_dx
+        self._save_rotate_calibration()
+        self.rotate_sens_label.config(text=f"\u6821\u51c6\u503c: {total_dx} \u50cf\u7d20/180\u00b0")
+        messagebox.showinfo("\u6821\u51c6\u5b8c\u6210", f"180\u00b0 \u5bf9\u5e94 {total_dx} \u50cf\u7d20\u9f20\u6807\u79fb\u52a8\u91cf\u3002\n\u73b0\u5728\u53ef\u4ee5\u7528\u6309\u94ae\u6216 F8 \u8f6c\u52a8\u89c6\u89d2\u3002", parent=self.root)
+
+    def _reset_rotate_calibration(self):
+        self.rotate_sensitivity = 0
+        self._save_rotate_calibration()
+        self.rotate_sens_label.config(text="\u672a\u6821\u51c6")
+
+    def _do_rotate(self):
+        if self.rotate_sensitivity <= 0:
+            messagebox.showwarning("\u89c6\u89d2\u8f6c\u52a8", "\u8bf7\u5148\u6821\u51c6\u3002", parent=self.root)
+            return
+        try: angle = int(self.rotate_angle_var.get())
+        except: angle = 180
+        total_dx = int(self.rotate_sensitivity * (angle / 180.0))
+        threading.Thread(target=self._rotate_worker, args=(total_dx,), daemon=True).start()
+
+    def _rotate_worker(self, total_dx):
+        # 分成 20-40 个大批次，每批次 dx 较大，模拟快速甩鼠标
+        batches = random.randint(20, 40)
+        weights = [random.uniform(0.5, 1.5) for _ in range(batches)]
+        w_sum = sum(weights)
+        dx_list = [max(1, int(total_dx * w / w_sum)) for w in weights]
+        dx_list[-1] += total_dx - sum(dx_list)
+        for i, dx in enumerate(dx_list):
+            dy = random.randint(-2, 2)
+            _send_mouse_input(MOUSEEVENTF_MOVE, dx=dx, dy=dy)
+            # 间隔极短，模拟高速甩枪
+            time.sleep(random.uniform(0.001, 0.004))
+
+    def _register_rotate_hotkey(self):
+        if keyboard is None: return
+        key = getattr(self, "_rotate_hotkey_name", "f8")
+        try:
+            if self._rotate_hotkey_handle:
+                keyboard.remove_hotkey(self._rotate_hotkey_handle)
+            self._rotate_hotkey_handle = keyboard.add_hotkey(key, lambda: self.ui_queue.put(("rotate", None)), suppress=False)
+        except: pass
+
     def _on_close(self):
         try:
             self.running = False
+            self.rotate_calibrating = False
             self._release_right()
             self._unregister_hotkey()
             if keyboard is not None:

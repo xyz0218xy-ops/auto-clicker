@@ -1,0 +1,73 @@
+{
+  "current_profile": "常规",
+  "profiles": {
+    "常规": {
+      "hotkey": "↓",
+      "click_method": "mouse_event(推荐)",
+      "positions": []
+    },
+    "生化速刷": {
+      "hotkey": "↓",
+      "jitter_enabled": true,
+      "jitter_min": 0.5,
+      "jitter_max": 2.0,
+      "items": []
+    },
+    "生化速刷1": {
+      "hotkey": "↓",
+      "jitter_enabled": true,
+      "jitter_min": 0.5,
+      "jitter_max": 2.0,
+      "items": []
+    },
+    "挑战": {
+      "hotkey": "↓",
+      "jitter_enabled": true,
+      "jitter_min": 0.5,
+      "jitter_max": 2.0,
+      "items": []
+    },
+    "1360x768生化速刷": {
+      "hotkey": "Down",
+      "jitter_enabled": true,
+      "jitter_min": 0.5,
+      "jitter_max": 2.0,
+      "items": []
+    },
+    "清卡机-卡槽一 0.1版本": {
+      "hotkey": "Up",
+      "jitter_enabled": true,
+      "jitter_min": 0.5,
+      "jitter_max": 2.0,
+      "items": []
+    },
+    "清卡机-卡槽二 0.1版本": {
+      "hotkey": "Right",
+      "jitter_enabled": true,
+      "jitter_min": 0.5,
+      "jitter_max": 2.0,
+      "items": []
+    },
+    "清卡机-卡槽三 0.1版本": {
+      "hotkey": "Right",
+      "jitter_enabled": true,
+      "jitter_min": 0.5,
+      "jitter_max": 2.0,
+      "items": []
+    },
+    "清卡机-卡槽二 3s版本": {
+      "hotkey": "Up",
+      "jitter_enabled": true,
+      "jitter_min": 0.5,
+      "jitter_max": 2.0,
+      "items": []
+    },
+    "方案11": {
+      "hotkey": "Up",
+      "jitter_enabled": true,
+      "jitter_min": 0.5,
+      "jitter_max": 2.0,
+      "items": []
+    }
+  }
+}

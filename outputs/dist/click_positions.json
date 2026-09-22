@@ -276,10 +276,10 @@
       ]
     },
     "1360x768生化速刷": {
-      "hotkey": "down",
+      "hotkey": "up",
       "right_hotkey": "f8",
       "auto_right_hold": false,
-      "cycle_interval": 0.0,
+      "cycle_interval": 1.0,
       "jitter_enabled": true,
       "jitter_min": 0.5,
       "jitter_max": 2.0,

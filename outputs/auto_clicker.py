@@ -8,9 +8,10 @@
   4. 数据持久化：配置保存在程序同目录的 click_positions.json，重启、换机都不丢
   5. 多方案管理：新建 / 复制 / 重命名 / 删除，方案之间数据完全独立
   6. 全局热键启停（默认 F12，可自定义任意键）
-  7. 按住右键：可点按钮、可按独立热键随时开关，也可设成随点击一起运行
+  7. 按住键：可采集任意键，可点按钮、可按独立热键随时开关，也可设成随点击一起运行
   8. 相对偏移：鼠标项可填「相对上一个鼠标点的偏移量」，不必重新采集
   9. 轮次间隔：每一轮循环之间可以单独设置等待时间
+ 10. Boss 卡计数模式：可选 OCR 识别卡片数量，按设定次数召唤后自动停止
 """
 
 import ctypes
@@ -141,6 +142,19 @@ _ensure_dll_path()
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+from count_mode import (
+    CountGuard,
+    CountSafetyError,
+    HAS_PIL as HAS_PIL_OCR,
+    HAS_PYTesseract as HAS_PYTesseract_OCR,
+    ocr_available,
+    parse_region,
+    read_count_once,
+    read_count_stable,
+    resolve_tesseract,
+    resolve_tessdata,
+)
+
 # ── 可选依赖：键盘钩子与按键模拟 ────────────────────────────────────────────
 try:
     import keyboard
@@ -152,16 +166,25 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v23"
+APP_VERSION = "v29"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
 MAX_INTERVAL = 7200.0     # 最大间隔（秒），即 2 小时
 MAX_OFFSET = 2000         # 相对偏移允许的最大像素数，避免填出离谱的坐标
 DEFAULT_HOTKEY = "f12"
-DEFAULT_RIGHT_HOTKEY = "f8"   # 按住右键的独立热键
+DEFAULT_RIGHT_HOTKEY = "f8"   # 按住键的独立热键
+DEFAULT_HOLD_KEY = "right"     # 默认按住的键（right=鼠标右键，也可设为任意键名）
 DEFAULT_JITTER_MIN = 0.5  # 随机倍率下限
 DEFAULT_JITTER_MAX = 2.0  # 随机倍率上限
+DEFAULT_COUNT_TARGET = 10
+DEFAULT_COUNT_STAR = 1
+DEFAULT_COUNT_OPEN_KEY = "e"
+DEFAULT_COUNT_OPEN_WAIT = 1.0
+DEFAULT_COUNT_POST_CLICK_WAIT = 2.0
+DEFAULT_COUNT_NEXT_CYCLE_WAIT = 5.0
+DEFAULT_COUNT_AUTO_NEXT = True
+DEFAULT_COUNT_REGION = (0, 0, 120, 36)
 
 user32 = ctypes.windll.user32
 
@@ -177,30 +200,6 @@ MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_WHEEL = 0x0800
 
 # --- Raw Input (兼容游戏的鼠标输入捕获) ---
-RIM_TYPEMOUSE = 0
-WM_INPUT = 0x00FF
-RID_INPUT = 0x10000003
-RIDEV_INPUTSINK = 0x00000100
-
-class RAWINPUTHEADER(ctypes.Structure):
-    _fields_ = [("dwType", ctypes.wintypes.DWORD), ("dwSize", ctypes.wintypes.DWORD),
-                ("hDevice", ctypes.wintypes.HANDLE), ("wParam", ctypes.wintypes.WPARAM)]
-
-class RAWMOUSE(ctypes.Structure):
-    _fields_ = [("usFlags", ctypes.c_ushort), ("usButtonFlags", ctypes.c_ushort),
-                ("usButtonData", ctypes.c_ushort), ("ulRawButtons", ctypes.c_ulong),
-                ("lLastX", ctypes.c_long), ("lLastY", ctypes.c_long),
-                ("ulExtraInformation", ctypes.c_ulong)]
-
-class RAWINPUT(ctypes.Structure):
-    _fields_ = [("header", RAWINPUTHEADER), ("mouse", RAWMOUSE)]
-
-class RAWINPUTDEVICE(ctypes.Structure):
-    _fields_ = [("usUsagePage", ctypes.c_ushort), ("usUsage", ctypes.c_ushort),
-                ("dwFlags", ctypes.wintypes.DWORD), ("hwndTarget", ctypes.wintypes.HWND)]
-
-RegisterRawInputDevices = user32.RegisterRawInputDevices
-GetRawInputData = user32.GetRawInputData
 
 class MOUSEINPUT(ctypes.Structure):
     _fields_ = [
@@ -224,6 +223,15 @@ class INPUT(ctypes.Structure):
 SendInput = user32.SendInput
 SendInput.argtypes = [ctypes.wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 SendInput.restype = ctypes.wintypes.UINT
+
+def _pixel_to_abs(x, y):
+    """将像素坐标转换为 SendInput 绝对坐标 (0-65535)。"""
+    sw = user32.GetSystemMetrics(0)
+    sh = user32.GetSystemMetrics(1)
+    if sw <= 0: sw = 1920
+    if sh <= 0: sh = 1080
+    return int(x * 65535 / sw), int(y * 65535 / sh)
+
 
 def _send_mouse_input(flags, dx=0, dy=0, data=0):
     inp = INPUT()
@@ -261,9 +269,9 @@ def human_move_to(target_x, target_y, duration=None):
     interval=duration/len(curve)
     for i,(px,py) in enumerate(curve):
         if i>len(curve)*0.7: px+=random.uniform(-1,1); py+=random.uniform(-1,1)
-        _send_mouse_input(MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE,dx=px,dy=py)
+        ax,ay=_pixel_to_abs(px,py); _send_mouse_input(MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE,dx=ax,dy=ay)
         time.sleep(interval*random.uniform(0.8,1.2))
-    _send_mouse_input(MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE,dx=target_x,dy=target_y)
+    ax,ay=_pixel_to_abs(target_x,target_y); _send_mouse_input(MOUSEEVENTF_MOVE|MOUSEEVENTF_ABSOLUTE,dx=ax,dy=ay)
 
 
 
@@ -393,18 +401,58 @@ def safe_seconds(value, default=0.0, low=0.0, high=MAX_INTERVAL):
     return max(low, min(high, number))
 
 
+def normalize_point(value, default=(0, 0)):
+    """把配置里的坐标统一成整数坐标元组。"""
+    if isinstance(value, dict):
+        value = (value.get("x"), value.get("y"))
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return tuple(default)
+    try:
+        return (int(float(value[0])), int(float(value[1])))
+    except (TypeError, ValueError):
+        return tuple(default)
+
+
+def normalize_region_map(raw, stars=5):
+    """统一数量识别区域配置，保留每个星级自己的区域。"""
+    raw = raw if isinstance(raw, dict) else {}
+    result = {}
+    for star in range(1, stars + 1):
+        value = raw.get(str(star), raw.get(star, DEFAULT_COUNT_REGION))
+        result[str(star)] = list(parse_region(value, DEFAULT_COUNT_REGION))
+    return result
+
+
 def normalize_profile(raw):
     raw = raw if isinstance(raw, dict) else {}
+    star_points = {}
+    raw_star_points = raw.get("count_star_points") if isinstance(raw.get("count_star_points"), dict) else {}
+    for star in range(1, 6):
+        star_points[str(star)] = dict(zip(("x", "y"), normalize_point(raw_star_points.get(str(star)))))
+    execution_mode = "count" if str(raw.get("execution_mode", "") or "").lower() in ("count", "boss_count") else "free"
     profile = {
         "hotkey": normalize_key_name(raw.get("hotkey") or raw.get("hotkey_vk")) or DEFAULT_HOTKEY,
         "right_hotkey": (normalize_key_name(raw.get("right_hotkey")
                                             or raw.get("right_hold_hotkey"))
                          or DEFAULT_RIGHT_HOTKEY),
+        "hold_key": normalize_key_name(raw.get("hold_key")) or DEFAULT_HOLD_KEY,
         "auto_right_hold": bool(raw.get("auto_right_hold", False)),
         "cycle_interval": safe_seconds(raw.get("cycle_interval"), 0.0),
         "jitter_enabled": bool(raw.get("jitter_enabled", True)),
         "jitter_min": float(raw.get("jitter_min", DEFAULT_JITTER_MIN) or DEFAULT_JITTER_MIN),
         "jitter_max": float(raw.get("jitter_max", DEFAULT_JITTER_MAX) or DEFAULT_JITTER_MAX),
+        "execution_mode": execution_mode,
+        "count_target": max(1, min(999999, int(safe_seconds(raw.get("count_target", DEFAULT_COUNT_TARGET), DEFAULT_COUNT_TARGET, 1, 999999)))),
+        "count_star": max(1, min(5, int(safe_seconds(raw.get("count_star", DEFAULT_COUNT_STAR), DEFAULT_COUNT_STAR, 1, 5)))),
+        "count_open_key": normalize_key_name(raw.get("count_open_key")) or DEFAULT_COUNT_OPEN_KEY,
+        "count_summon_point": dict(zip(("x", "y"), normalize_point(raw.get("count_summon_point")))),
+        "count_star_points": star_points,
+        "count_ocr_regions": normalize_region_map(raw.get("count_ocr_regions")),
+        "count_open_wait": safe_seconds(raw.get("count_open_wait"), DEFAULT_COUNT_OPEN_WAIT, 0.05, MAX_INTERVAL),
+        "count_post_click_wait": safe_seconds(raw.get("count_post_click_wait"), DEFAULT_COUNT_POST_CLICK_WAIT, 0.05, MAX_INTERVAL),
+        "count_next_cycle_wait": safe_seconds(raw.get("count_next_cycle_wait"), DEFAULT_COUNT_NEXT_CYCLE_WAIT, 0.05, MAX_INTERVAL),
+        "count_auto_next": bool(raw.get("count_auto_next", DEFAULT_COUNT_AUTO_NEXT)),
+        "count_progress": max(0, int(safe_seconds(raw.get("count_progress", 0), 0, 0, 999999))),
         "items": [],
     }
     entries = raw.get("items")
@@ -581,10 +629,10 @@ def get_cursor_pos():
     return point.x, point.y
 
 
-def mouse_click_left(x, y):
+def mouse_click_left(x, y, jitter=True):
     """Bezier + SendInput."""
-    offset_x = random.uniform(-2, 2)
-    offset_y = random.uniform(-2, 2)
+    offset_x = random.uniform(-2, 2) if jitter else 0
+    offset_y = random.uniform(-2, 2) if jitter else 0
     human_move_to(int(x + offset_x), int(y + offset_y))
     time.sleep(random.uniform(0.01, 0.03))
     _send_mouse_input(MOUSEEVENTF_LEFTDOWN)
@@ -647,6 +695,7 @@ class AutoClicker:
         self.items = []
         self.hotkey = DEFAULT_HOTKEY
         self.hotkey_handle = None
+        self.hold_key = DEFAULT_HOLD_KEY
         self.right_hotkey = DEFAULT_RIGHT_HOTKEY
         self.right_hotkey_handle = None
         self.auto_right_hold = False
@@ -656,18 +705,24 @@ class AutoClicker:
         self.jitter_min = DEFAULT_JITTER_MIN
         self.jitter_max = DEFAULT_JITTER_MAX
         self.cycle_interval = 0.0
+        self.execution_mode = "free"
+        self.count_target = DEFAULT_COUNT_TARGET
+        self.count_star = DEFAULT_COUNT_STAR
+        self.count_open_key = DEFAULT_COUNT_OPEN_KEY
+        self.count_summon_point = {"x": 0, "y": 0}
+        self.count_star_points = {str(star): {"x": 0, "y": 0} for star in range(1, 6)}
+        self.count_ocr_regions = {str(star): list(DEFAULT_COUNT_REGION) for star in range(1, 6)}
+        self.count_open_wait = DEFAULT_COUNT_OPEN_WAIT
+        self.count_post_click_wait = DEFAULT_COUNT_POST_CLICK_WAIT
+        self.count_next_cycle_wait = DEFAULT_COUNT_NEXT_CYCLE_WAIT
+        self.count_auto_next = DEFAULT_COUNT_AUTO_NEXT
+        self.count_progress = 0
         self._save_job = None
         self._key_target = None
 
         self.running = False
 
         # Rotation
-        self.rotate_calibrating = False
-        self._rotate_calib_total = 0
-        self._rotate_calib_prev = None
-        self.rotate_sensitivity = 0
-        self._rotate_hotkey_name = "f8"
-        self._rotate_hotkey_handle = None
         self.click_thread = None
         self.right_held = False
         self.right_thread = None
@@ -676,15 +731,14 @@ class AutoClicker:
 
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.root.minsize(600, 680)
+        self.root.minsize(600, 920)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._center_window(660, 780)
+        self._center_window(760, 980)
 
         self._build_ui()
         self._load_profile(self.current_profile)
         self._register_hotkey()
         self._save_now()
-        self._load_rotate_calibration()
         self.root.after(60, self._pump_queue)
 
     def _center_window(self, width, height):
@@ -723,11 +777,16 @@ class AutoClicker:
         ttk.Label(row1, textvariable=self.hotkey_var, width=8, anchor=tk.CENTER,
                   relief=tk.SUNKEN).pack(side=tk.LEFT, padx=4)
         ttk.Button(row1, text="设置", width=6, command=self._start_set_hotkey).pack(side=tk.LEFT)
-        ttk.Label(row1, text="按住右键").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(row1, text="按住键").pack(side=tk.LEFT, padx=(12, 0))
+        self.hold_key_var = tk.StringVar(value=key_display(self.hold_key))
+        ttk.Label(row1, textvariable=self.hold_key_var, width=8, anchor=tk.CENTER,
+                  relief=tk.SUNKEN).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row1, text="采集", width=6,
+                   command=self._start_set_hold_key).pack(side=tk.LEFT)
         self.right_hotkey_var = tk.StringVar(value=key_display(self.right_hotkey))
         ttk.Label(row1, textvariable=self.right_hotkey_var, width=8, anchor=tk.CENTER,
-                  relief=tk.SUNKEN).pack(side=tk.LEFT, padx=4)
-        ttk.Button(row1, text="设置", width=6,
+                  relief=tk.SUNKEN).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(row1, text="热键", width=6,
                    command=self._start_set_right_hotkey).pack(side=tk.LEFT)
         ttk.Label(row1, text="默认间隔").pack(side=tk.LEFT, padx=(12, 3))
         self.default_interval_var = tk.StringVar(value="1")
@@ -791,6 +850,89 @@ class AutoClicker:
         for text, command in actions:
             ttk.Button(action_bar, text=text, command=command).pack(side=tk.LEFT, padx=2)
 
+        # Boss 卡计数模式：与自由循环共存，OCR 不可用时不会影响自由模式
+        count_frame = ttk.LabelFrame(self.root, text="Boss 卡计数模式（可选）")
+        count_frame.pack(fill=tk.X, padx=8, pady=(6, 4))
+
+        count_top = ttk.Frame(count_frame)
+        count_top.pack(fill=tk.X, padx=8, pady=(5, 2))
+        ttk.Label(count_top, text="模式").pack(side=tk.LEFT)
+        self.execution_mode_var = tk.StringVar(value="自由循环")
+        self.execution_mode_box = ttk.Combobox(
+            count_top, textvariable=self.execution_mode_var, state="readonly",
+            values=("自由循环", "Boss 卡计数"), width=12)
+        self.execution_mode_box.pack(side=tk.LEFT, padx=4)
+        self.execution_mode_box.bind("<<ComboboxSelected>>", lambda _event: self._on_change())
+        ttk.Label(count_top, text="目标次数").pack(side=tk.LEFT, padx=(10, 2))
+        self.count_target_var = tk.StringVar(value=str(DEFAULT_COUNT_TARGET))
+        ttk.Entry(count_top, textvariable=self.count_target_var, width=7).pack(side=tk.LEFT)
+        ttk.Label(count_top, text="星级").pack(side=tk.LEFT, padx=(10, 2))
+        self.count_star_var = tk.StringVar(value=str(DEFAULT_COUNT_STAR))
+        self.count_star_box = ttk.Combobox(
+            count_top, textvariable=self.count_star_var, state="readonly",
+            values=("1", "2", "3", "4", "5"), width=4)
+        self.count_star_box.pack(side=tk.LEFT)
+        self.count_star_box.bind("<<ComboboxSelected>>", self._on_count_star_change)
+        ttk.Label(count_top, text="唤出键").pack(side=tk.LEFT, padx=(10, 2))
+        self.count_open_key_var = tk.StringVar(value=key_display(DEFAULT_COUNT_OPEN_KEY))
+        self.count_open_key_holder = {"name": DEFAULT_COUNT_OPEN_KEY}
+        ttk.Entry(count_top, textvariable=self.count_open_key_var, width=7,
+                  state="readonly").pack(side=tk.LEFT)
+        ttk.Button(count_top, text="采集", width=6,
+                   command=lambda: self._start_key_capture(
+                       ("count_open_key", self.count_open_key_var, self.count_open_key_holder),
+                       "请按下用于唤出召唤界面的按键…")).pack(side=tk.LEFT, padx=3)
+
+        count_points = ttk.Frame(count_frame)
+        count_points.pack(fill=tk.X, padx=8, pady=2)
+        ttk.Label(count_points, text="召唤按钮 X/Y").pack(side=tk.LEFT)
+        self.count_summon_x_var = tk.StringVar(value="0")
+        self.count_summon_y_var = tk.StringVar(value="0")
+        ttk.Entry(count_points, textvariable=self.count_summon_x_var, width=8).pack(side=tk.LEFT, padx=3)
+        ttk.Entry(count_points, textvariable=self.count_summon_y_var, width=8).pack(side=tk.LEFT)
+        ttk.Button(count_points, text="采集召唤按钮", width=12,
+                   command=self._capture_count_summon).pack(side=tk.LEFT, padx=5)
+        ttk.Label(count_points, text="当前星级坐标 X/Y").pack(side=tk.LEFT, padx=(10, 2))
+        self.count_star_x_var = tk.StringVar(value="0")
+        self.count_star_y_var = tk.StringVar(value="0")
+        ttk.Entry(count_points, textvariable=self.count_star_x_var, width=8).pack(side=tk.LEFT, padx=3)
+        ttk.Entry(count_points, textvariable=self.count_star_y_var, width=8).pack(side=tk.LEFT)
+        ttk.Button(count_points, text="采集当前星级", width=12,
+                   command=self._capture_count_star).pack(side=tk.LEFT, padx=5)
+
+        count_ocr = ttk.Frame(count_frame)
+        count_ocr.pack(fill=tk.X, padx=8, pady=2)
+        ttk.Label(count_ocr, text="数量区域 X,Y,W,H").pack(side=tk.LEFT)
+        self.count_region_var = tk.StringVar(value="0,0,120,36")
+        ttk.Entry(count_ocr, textvariable=self.count_region_var, width=18).pack(side=tk.LEFT, padx=3)
+        ttk.Button(count_ocr, text="采集数量区域", width=12,
+                   command=self._capture_count_region).pack(side=tk.LEFT, padx=3)
+        ttk.Label(count_ocr, text="测试读取").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Button(count_ocr, text="读取一次", width=9,
+                   command=self._test_count_ocr).pack(side=tk.LEFT)
+        ttk.Button(count_ocr, text="重置进度", width=9,
+                   command=self._reset_count_progress).pack(side=tk.LEFT, padx=3)
+
+        count_options = ttk.Frame(count_frame)
+        count_options.pack(fill=tk.X, padx=8, pady=(2, 5))
+        self.count_auto_next_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(count_options, text="达到目标自动停止（连续循环）",
+                        variable=self.count_auto_next_var,
+                        command=self._on_change).pack(side=tk.LEFT)
+        ttk.Label(count_options, text="召唤后等待").pack(side=tk.LEFT, padx=(10, 2))
+        self.count_post_click_wait_var = tk.StringVar(value=f"{DEFAULT_COUNT_POST_CLICK_WAIT:g}")
+        ttk.Entry(count_options, textvariable=self.count_post_click_wait_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(count_options, text="秒；下一轮").pack(side=tk.LEFT, padx=3)
+        self.count_next_cycle_wait_var = tk.StringVar(value=f"{DEFAULT_COUNT_NEXT_CYCLE_WAIT:g}")
+        ttk.Entry(count_options, textvariable=self.count_next_cycle_wait_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(count_options, text="秒").pack(side=tk.LEFT, padx=2)
+        self.count_progress_var = tk.StringVar(value="进度 0 / 10")
+        ttk.Label(count_options, textvariable=self.count_progress_var,
+                  foreground="#245").pack(side=tk.RIGHT, padx=8)
+        self.count_ocr_status_var = tk.StringVar(value="OCR：未测试")
+        ttk.Label(count_options, textvariable=self.count_ocr_status_var,
+                  foreground="#666").pack(side=tk.RIGHT, padx=8)
+
         # 执行控制
         control_bar = ttk.Frame(self.root)
         control_bar.pack(fill=tk.X, padx=8, pady=(6, 2))
@@ -799,28 +941,14 @@ class AutoClicker:
         self.btn_stop = ttk.Button(control_bar, text="⏹ 停止", width=10,
                                    command=self._stop_clicking, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=3)
-        self.btn_right = ttk.Button(control_bar, text="按住右键", width=10, command=self._toggle_right_hold)
+        self.btn_right = ttk.Button(control_bar, text="按住键", width=10, command=self._toggle_right_hold)
         self.btn_right.pack(side=tk.LEFT, padx=3)
         ttk.Button(control_bar, text="清空列表", width=10, command=self._clear_items).pack(side=tk.LEFT, padx=3)
-
-        # Rotation panel
-        rotate_bar = ttk.LabelFrame(self.root, text="\u89c6\u89d2\u8f6c\u52a8")
-        rotate_bar.pack(fill=tk.X, padx=8, pady=(4, 2))
-        rotate_row1 = ttk.Frame(rotate_bar)
-        rotate_row1.pack(fill=tk.X, padx=6, pady=(4, 2))
-        self.rotate_sens_label = ttk.Label(rotate_row1, text="\u672a\u6821\u51c6", width=20)
-        self.rotate_sens_label.pack(side=tk.LEFT, padx=4)
-        ttk.Button(rotate_row1, text="\u6821\u51c6180\u00b0", width=12, command=self._start_rotate_calibration).pack(side=tk.LEFT, padx=3)
-        ttk.Button(rotate_row1, text="\u91cd\u7f6e", width=8, command=self._reset_rotate_calibration).pack(side=tk.LEFT, padx=3)
-        ttk.Label(rotate_row1, text="\u89d2\u5ea6\uff1a").pack(side=tk.LEFT, padx=(12, 0))
-        self.rotate_angle_var = tk.StringVar(value="180")
-        ttk.Combobox(rotate_row1, textvariable=self.rotate_angle_var, values=["90", "180", "360"], width=6, state="readonly").pack(side=tk.LEFT, padx=4)
-        ttk.Button(rotate_row1, text="\u8f6c\u52a8", width=8, command=self._do_rotate).pack(side=tk.LEFT, padx=(12, 3))
 
         option_bar = ttk.Frame(self.root)
         option_bar.pack(fill=tk.X, padx=8, pady=(4, 0))
         self.auto_right_hold_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(option_bar, text="运行开始时同步按住右键（停止时自动松开）",
+        ttk.Checkbutton(option_bar, text="运行开始时同步按住键（停止时自动松开）",
                         variable=self.auto_right_hold_var,
                         command=self._on_change).pack(side=tk.LEFT)
 
@@ -845,14 +973,40 @@ class AutoClicker:
 
     # ── 方案管理 ────────────────────────────────────────────────────────────
     def _collect_profile(self):
+        execution_mode = "count" if self.execution_mode_var.get() == "Boss 卡计数" else "free"
+        try:
+            count_target = int(float(self.count_target_var.get()))
+        except (TypeError, ValueError):
+            count_target = DEFAULT_COUNT_TARGET
+        try:
+            count_star = int(float(self.count_star_var.get()))
+        except (TypeError, ValueError):
+            count_star = DEFAULT_COUNT_STAR
+        count_open_key = self.count_open_key_holder.get("name") or DEFAULT_COUNT_OPEN_KEY
         return {
             "hotkey": self.hotkey,
             "right_hotkey": self.right_hotkey,
+            "hold_key": self.hold_key,
             "auto_right_hold": bool(self.auto_right_hold_var.get()),
             "cycle_interval": self._cycle_value(),
             "jitter_enabled": bool(self.jitter_on_var.get()),
             "jitter_min": self._safe_float(self.jitter_min_var.get(), DEFAULT_JITTER_MIN),
             "jitter_max": self._safe_float(self.jitter_max_var.get(), DEFAULT_JITTER_MAX),
+            "execution_mode": execution_mode,
+            "count_target": max(1, min(999999, count_target)),
+            "count_star": max(1, min(5, count_star)),
+            "count_open_key": count_open_key,
+            "count_summon_point": {
+                "x": int(self._safe_float(self.count_summon_x_var.get(), 0)),
+                "y": int(self._safe_float(self.count_summon_y_var.get(), 0)),
+            },
+            "count_star_points": {key: dict(value) for key, value in self.count_star_points.items()},
+            "count_ocr_regions": {key: list(value) for key, value in self.count_ocr_regions.items()},
+            "count_open_wait": self.count_open_wait,
+            "count_post_click_wait": self._safe_float(self.count_post_click_wait_var.get(), DEFAULT_COUNT_POST_CLICK_WAIT),
+            "count_next_cycle_wait": self._safe_float(self.count_next_cycle_wait_var.get(), DEFAULT_COUNT_NEXT_CYCLE_WAIT),
+            "count_auto_next": bool(self.count_auto_next_var.get()),
+            "count_progress": max(0, int(self.count_progress)),
             "items": [dict(item) for item in self.items],
         }
 
@@ -865,11 +1019,37 @@ class AutoClicker:
         self.hotkey_var.set(key_display(self.hotkey))
         self.right_hotkey = profile["right_hotkey"]
         self.right_hotkey_var.set(key_display(self.right_hotkey))
+        self.hold_key = profile.get("hold_key", DEFAULT_HOLD_KEY)
+        self.hold_key_var.set(key_display(self.hold_key))
         self.auto_right_hold_var.set(profile["auto_right_hold"])
         self.cycle_var.set(f"{profile['cycle_interval']:g}")
         self.jitter_on_var.set(profile["jitter_enabled"])
         self.jitter_min_var.set(f"{profile['jitter_min']:g}")
         self.jitter_max_var.set(f"{profile['jitter_max']:g}")
+        self.execution_mode_var.set("Boss 卡计数" if profile["execution_mode"] == "count" else "自由循环")
+        self.count_target = profile["count_target"]
+        self.count_star = profile["count_star"]
+        self.count_target_var.set(str(self.count_target))
+        self.count_star_var.set(str(self.count_star))
+        self.count_open_key = profile["count_open_key"]
+        self.count_open_key_holder["name"] = self.count_open_key
+        self.count_open_key_var.set(key_display(self.count_open_key))
+        self.count_summon_point = dict(profile["count_summon_point"])
+        self.count_summon_x_var.set(str(self.count_summon_point["x"]))
+        self.count_summon_y_var.set(str(self.count_summon_point["y"]))
+        self.count_star_points = {key: dict(value) for key, value in profile["count_star_points"].items()}
+        self.count_ocr_regions = {key: list(value) for key, value in profile["count_ocr_regions"].items()}
+        self.count_open_wait = profile["count_open_wait"]
+        self.count_post_click_wait = profile["count_post_click_wait"]
+        self.count_next_cycle_wait = profile["count_next_cycle_wait"]
+        self.count_auto_next = profile["count_auto_next"]
+        self.count_progress = profile["count_progress"]
+        self.count_post_click_wait_var.set(f"{self.count_post_click_wait:g}")
+        self.count_next_cycle_wait_var.set(f"{self.count_next_cycle_wait:g}")
+        self.count_auto_next_var.set(self.count_auto_next)
+        self.count_progress_var.set(f"进度 {self.count_progress} / {self.count_target}")
+        self.count_ocr_status_var.set("OCR：未测试")
+        self._on_count_star_change()
         self.profile_var.set(name)
         self._sync_jitter()
         self._refresh_profile_list()
@@ -1326,6 +1506,97 @@ class AutoClicker:
         win.grab_set()
         win.focus_set()
 
+    def _capture_count_summon(self):
+        def done(x_value, y_value):
+            self.count_summon_x_var.set(str(x_value))
+            self.count_summon_y_var.set(str(y_value))
+            self._on_change()
+            self.status_var.set(f"已采集召唤按钮 ({x_value}, {y_value})")
+
+        self._countdown_window("请把鼠标移到 Boss 召唤按钮中心，倒计时结束后自动记录", done)
+
+    def _capture_count_star(self):
+        try:
+            star = str(max(1, min(5, int(float(self.count_star_var.get())))))
+        except (TypeError, ValueError):
+            star = "1"
+
+        def done(x_value, y_value):
+            self.count_star_x_var.set(str(x_value))
+            self.count_star_y_var.set(str(y_value))
+            self.count_star_points[star] = {"x": int(x_value), "y": int(y_value)}
+            self._on_change()
+            self.status_var.set(f"已采集 {star} 星级坐标 ({x_value}, {y_value})")
+
+        self._countdown_window(f"请把鼠标移到 {star} 星级卡片位置，倒计时结束后自动记录", done)
+
+    def _capture_count_region(self):
+        def done(x_value, y_value):
+            width, height = 120, 36
+            region = [max(0, int(x_value - width // 2)), max(0, int(y_value - height // 2)), width, height]
+            self.count_region_var.set(",".join(str(item) for item in region))
+            try:
+                star = str(max(1, min(5, int(float(self.count_star_var.get())))))
+            except (TypeError, ValueError):
+                star = "1"
+            self.count_ocr_regions[star] = region
+            self._on_change()
+            self.status_var.set(f"已采集 {star} 星级数量区域 {','.join(str(item) for item in region)}")
+
+        self._countdown_window("请把鼠标移到 Boss 卡数量数字右下角，倒计时结束后自动记录", done)
+
+    def _current_count_region(self):
+        try:
+            star = str(max(1, min(5, int(float(self.count_star_var.get())))))
+        except (TypeError, ValueError):
+            star = "1"
+        region = parse_region(self.count_region_var.get(), self.count_ocr_regions.get(star, DEFAULT_COUNT_REGION))
+        self.count_ocr_regions[star] = list(region)
+        return region
+
+    def _on_count_star_change(self, _event=None):
+        try:
+            star = str(max(1, min(5, int(float(self.count_star_var.get())))))
+        except (TypeError, ValueError):
+            star = "1"
+        point = self.count_star_points.get(star, {"x": 0, "y": 0})
+        self.count_star_x_var.set(str(point.get("x", 0)))
+        self.count_star_y_var.set(str(point.get("y", 0)))
+        region = self.count_ocr_regions.get(star, list(DEFAULT_COUNT_REGION))
+        self.count_region_var.set(",".join(str(item) for item in region))
+
+    def _test_count_ocr(self):
+        region = self._current_count_region()
+        if not ocr_available():
+            missing = []
+            if not HAS_PIL_OCR:
+                missing.append("Pillow")
+            if not HAS_PYTesseract_OCR:
+                missing.append("pytesseract")
+            if not resolve_tesseract():
+                missing.append("Tesseract")
+            elif not resolve_tessdata(resolve_tesseract()):
+                missing.append("Tesseract 语言包")
+            self.count_ocr_status_var.set("OCR：" + ("、".join(missing) + " 缺失" if missing else "不可用"))
+            messagebox.showwarning(
+                APP_NAME,
+                "OCR 当前不可用，自由模式不受影响。\n缺失组件：" + "、".join(missing or ["未知"]),
+                parent=self.root)
+            return
+        value = read_count_once(region)
+        if value is None:
+            self.count_ocr_status_var.set("OCR：读取失败")
+            self.status_var.set("数量识别失败，请检查区域、分辨率和 Tesseract 语言包")
+        else:
+            self.count_ocr_status_var.set(f"OCR：{value}")
+            self.status_var.set(f"数量识别成功：{value}")
+
+    def _reset_count_progress(self):
+        self.count_progress = 0
+        self.count_progress_var.set("进度 0 / " + str(self.count_target))
+        self._on_change()
+        self.status_var.set("Boss 卡计数进度已重置")
+
     @staticmethod
     def _fill_cursor(x_var, y_var):
         cursor_x, cursor_y = get_cursor_pos()
@@ -1380,6 +1651,9 @@ class AutoClicker:
     def _start_set_hotkey(self):
         self._start_key_capture("hotkey", "请按下要作为启停热键的按键…")
 
+    def _start_set_hold_key(self):
+        self._start_key_capture("hold_key", "请按下要按住的键（如 space、a、right 等）…")
+
     def _start_set_right_hotkey(self):
         self._start_key_capture("right_hotkey", "请按下要作为「按住右键」热键的按键…")
 
@@ -1423,6 +1697,25 @@ class AutoClicker:
             self._register_hotkey()
             self._on_change()
             self.status_var.set(f"启停热键已设为 {key_display(self.hotkey)}")
+        elif target == "hold_key":
+            hold_key = normalize_key_name(name) or name
+            if hold_key == self.hotkey:
+                self.status_var.set(f"{key_display(hold_key)} 已用于启停，请换一个键")
+                return
+            self.hold_key = hold_key
+            self.hold_key_var.set(key_display(self.hold_key))
+            self._on_change()
+            self.status_var.set(f"按住键已设为 {key_display(self.hold_key)}")
+        elif isinstance(target, tuple) and target and target[0] == "count_open_key":
+            count_open_key = normalize_key_name(name) or name
+            if count_open_key == self.hotkey:
+                self.status_var.set(f"{key_display(count_open_key)} 已用于启停，请换一个键")
+                return
+            self.count_open_key = count_open_key
+            self.count_open_key_holder["name"] = count_open_key
+            target[1].set(key_display(count_open_key))
+            self._on_change()
+            self.status_var.set(f"召唤唤出键已设为 {key_display(count_open_key)}")
         elif target == "right_hotkey":
             right_hotkey = normalize_key_name(name) or DEFAULT_RIGHT_HOTKEY
             if right_hotkey == self.hotkey:
@@ -1432,7 +1725,7 @@ class AutoClicker:
             self.right_hotkey_var.set(key_display(self.right_hotkey))
             self._register_hotkey()
             self._on_change()
-            self.status_var.set(f"按住右键热键已设为 {key_display(self.right_hotkey)}")
+            self.status_var.set(f"按住键热键已设为 {key_display(self.right_hotkey)}")
         elif target == "new_item":
             key_name = normalize_key_name(name) or name
             self.items.append({
@@ -1471,7 +1764,6 @@ class AutoClicker:
                 self.right_hotkey_handle = None
                 self.status_var.set(f"热键 {key_display(self.right_hotkey)} 注册失败：{exc}")
 
-        self._register_rotate_hotkey()
 
     def _unregister_hotkey(self):
         if keyboard is not None:
@@ -1514,11 +1806,15 @@ class AutoClicker:
             self.running = False
             self.btn_start.config(state=tk.NORMAL)
             self.btn_stop.config(state=tk.DISABLED)
+            if self.right_held and self.right_held_auto:
+                self._release_right()
             self.status_var.set("已停止")
+        elif kind == "count_progress":
+            self.count_progress = max(0, int(message[1]))
+            self.count_progress_var.set(f"进度 {self.count_progress} / {self.count_target}")
+            self._save_now()
         elif kind == "error":
             messagebox.showerror(APP_NAME, message[1], parent=self.root)
-        elif kind == "rotate":
-            self._do_rotate()
         elif kind == "key":
             self._handle_key_captured(message[1], message[2])
 
@@ -1541,7 +1837,34 @@ class AutoClicker:
     def _start_clicking(self):
         if self.running:
             return
-        if not self.items:
+        self._sync_count_values()
+        if self.execution_mode_var.get() == "Boss 卡计数":
+            if not ocr_available():
+                messagebox.showwarning(
+                    APP_NAME,
+                    "Boss 卡计数模式需要 Pillow、pytesseract 和 Tesseract。\n"
+                    "当前 OCR 不可用；自由循环模式仍可使用。",
+                    parent=self.root)
+                return
+            if not HAS_KEYBOARD:
+                messagebox.showwarning(APP_NAME, "Boss 卡计数模式需要 keyboard 库来按唤出键。", parent=self.root)
+                return
+            summon = self.count_summon_point
+            star_point = self.count_star_points.get(str(self.count_star), {"x": 0, "y": 0})
+            region = parse_region(self.count_ocr_regions.get(str(self.count_star), DEFAULT_COUNT_REGION), DEFAULT_COUNT_REGION)
+            if summon.get("x", 0) == 0 and summon.get("y", 0) == 0:
+                messagebox.showwarning(APP_NAME, "请先采集召唤按钮坐标。", parent=self.root)
+                return
+            if star_point.get("x", 0) == 0 and star_point.get("y", 0) == 0:
+                messagebox.showwarning(APP_NAME, f"请先采集 {self.count_star} 星级卡片坐标。", parent=self.root)
+                return
+            if region[2] < 20 or region[3] < 8:
+                messagebox.showwarning(APP_NAME, "OCR 数量区域至少需要 20x8 像素，请重新采集。", parent=self.root)
+                return
+            if self.count_target <= 0:
+                messagebox.showwarning(APP_NAME, "目标次数必须大于 0。", parent=self.root)
+                return
+        elif not self.items:
             messagebox.showwarning(APP_NAME, "列表为空，请先采集或手动添加。", parent=self.root)
             return
         self.running = True
@@ -1549,7 +1872,8 @@ class AutoClicker:
         self.btn_stop.config(state=tk.NORMAL)
         if self.auto_right_hold_var.get():
             self._press_right(auto=True)
-        self.click_thread = threading.Thread(target=self._click_loop, daemon=True)
+        target = self._count_loop if self.execution_mode_var.get() == "Boss 卡计数" else self._click_loop
+        self.click_thread = threading.Thread(target=target, daemon=True)
         self.click_thread.start()
 
     def _stop_clicking(self):
@@ -1566,9 +1890,85 @@ class AutoClicker:
         """循环执行的入口：不管中间出什么意外，都要复位状态并通知界面。"""
         try:
             self._click_rounds()
+        except Exception as exc:
+            self._set_status(f"执行出错：{exc}")
         finally:
             self.running = False
             self.ui_queue.put(("stopped", None))
+
+    def _count_loop(self):
+        """Boss 卡计数模式入口：OCR 不稳定或数量异常时立即停止。"""
+        try:
+            self._run_count_mode()
+        except CountSafetyError as exc:
+            self._set_status(f"计数已停止：{exc}")
+        except Exception as exc:
+            self._set_status(f"计数执行出错：{exc}")
+        finally:
+            self.running = False
+            self.ui_queue.put(("stopped", None))
+
+    def _sync_count_values(self):
+        """把界面上的计数参数写入运行时变量，避免启动线程后读取到旧值。"""
+        try:
+            self.count_target = max(1, min(999999, int(float(self.count_target_var.get()))))
+        except (TypeError, ValueError):
+            self.count_target = DEFAULT_COUNT_TARGET
+            self.count_target_var.set(str(self.count_target))
+        try:
+            self.count_star = max(1, min(5, int(float(self.count_star_var.get()))))
+        except (TypeError, ValueError):
+            self.count_star = DEFAULT_COUNT_STAR
+            self.count_star_var.set(str(self.count_star))
+        self.count_open_key = self.count_open_key_holder.get("name") or DEFAULT_COUNT_OPEN_KEY
+        self.count_summon_point = {
+            "x": int(self._safe_float(self.count_summon_x_var.get(), 0)),
+            "y": int(self._safe_float(self.count_summon_y_var.get(), 0)),
+        }
+        self.count_post_click_wait = max(
+            MIN_INTERVAL, min(MAX_INTERVAL, self._safe_float(self.count_post_click_wait_var.get(), DEFAULT_COUNT_POST_CLICK_WAIT)))
+        self.count_next_cycle_wait = max(
+            MIN_INTERVAL, min(MAX_INTERVAL, self._safe_float(self.count_next_cycle_wait_var.get(), DEFAULT_COUNT_NEXT_CYCLE_WAIT)))
+        self.count_auto_next = bool(self.count_auto_next_var.get())
+        self.count_progress_var.set(f"进度 {self.count_progress} / {self.count_target}")
+
+    def _run_count_mode(self):
+        """安全计数状态机：稳定 OCR → 点击 → 等待变化 → 确认一次消耗。"""
+        star = self.count_star
+        summon = self.count_summon_point
+        star_point = self.count_star_points.get(str(star), {"x": 0, "y": 0})
+        region = parse_region(self.count_ocr_regions.get(str(star), DEFAULT_COUNT_REGION), DEFAULT_COUNT_REGION)
+        guard = CountGuard(self.count_target, self.count_progress)
+        command = resolve_tesseract()
+        tessdata_dir = resolve_tessdata(command)
+        while self.running and not guard.reached:
+            self._set_status(f"计数模式：等待 {star} 星级召唤界面（进度 {guard.progress}/{guard.target}）")
+            if not key_tap(self.count_open_key):
+                raise CountSafetyError(f"唤出键 {key_display(self.count_open_key)} 执行失败")
+            self._sleep_interruptible(self.count_open_wait)
+            before, stable_count, _raw = read_count_stable(region, command=command, tessdata_dir=tessdata_dir)
+            if before is None:
+                raise CountSafetyError(f"召唤界面 OCR 不稳定（连续稳定读取 {stable_count} 次）")
+            self._set_status(f"OCR 识别到当前数量：{before}")
+            mouse_click_left(int(star_point["x"]), int(star_point["y"]), jitter=False)
+            self._sleep_interruptible(random.uniform(0.12, 0.24))
+            mouse_click_left(int(summon["x"]), int(summon["y"]), jitter=False)
+            self._sleep_interruptible(self.count_post_click_wait)
+            after, stable_count, _raw = read_count_stable(region, command=command, tessdata_dir=tessdata_dir)
+            if after is None:
+                raise CountSafetyError(f"召唤后 OCR 不稳定（连续稳定读取 {stable_count} 次）")
+            progress = guard.confirm(before, after)
+            self.count_progress = progress
+            self._set_status(f"已确认消耗 1 张：{before} → {after}，进度 {progress}/{guard.target}")
+            self.ui_queue.put(("count_progress", progress))
+            if guard.reached:
+                self._set_status(f"计数完成：已召唤 {progress} 次，自动停止")
+                break
+            if not self.count_auto_next:
+                self._set_status(f"已召唤 {progress} 次，连续循环已关闭，自动停止")
+                break
+            self._set_status(f"等待击杀 Boss 后进入下一轮（{format_seconds(self.count_next_cycle_wait)}）")
+            self._sleep_interruptible(self.count_next_cycle_wait)
 
     def _click_rounds(self):
         while self.running:
@@ -1602,7 +2002,7 @@ class AutoClicker:
         while self.running and time.time() < end:
             time.sleep(min(0.05, max(0.0, end - time.time())))
 
-    # ── 按住右键 ────────────────────────────────────────────────────────────
+    # ── 按住键（支持任意键 + 普通输入体验优化）────────────────────────────
     def _toggle_right_hold(self):
         if self.right_held:
             self._release_right()
@@ -1614,25 +2014,57 @@ class AutoClicker:
             return
         self.right_held = True
         self.right_held_auto = bool(auto)
+        key = self.hold_key
+        # 按下键
+        if key == "right":
+            mouse_right_down()
+        elif HAS_KEYBOARD:
+            keyboard.press(key)
         self.right_thread = threading.Thread(target=self._right_hold_loop, daemon=True)
         self.right_thread.start()
-        self.btn_right.config(text="松开右键")
-        self.status_var.set("右键已按住（点按钮或按热键松开）")
+        self.btn_right.config(text="松开键")
+        self.status_var.set(f"已按住 {key_display(key)}（点按钮或按热键松开）")
 
     def _right_hold_loop(self):
+        """持续按住并加入自然输入节奏：随机微松开、微抖动。"""
+        key = self.hold_key
+        hold_start = time.time()
         while self.right_held:
-            mouse_right_down()
-            time.sleep(random.uniform(0.03, 0.08))
-            time.sleep(0.05)
+            # 每 2-5 秒做一次微松开（10-30ms），模拟手指自然颤动
+            elapsed = time.time() - hold_start
+            if elapsed > random.uniform(2.0, 5.0):
+                if key == "right":
+                    mouse_right_up()
+                elif HAS_KEYBOARD:
+                    keyboard.release(key)
+                time.sleep(random.uniform(0.01, 0.03))
+                if not self.right_held:
+                    break
+                if key == "right":
+                    mouse_right_down()
+                elif HAS_KEYBOARD:
+                    keyboard.press(key)
+                hold_start = time.time()
+            # 随机微抖动（±1-3px），模拟手部自然颤抖
+            if random.random() < 0.3:
+                dx = random.randint(-3, 3)
+                dy = random.randint(-3, 3)
+                _send_mouse_input(MOUSEEVENTF_MOVE, dx=dx, dy=dy)
+            # 自然节律间隔
+            time.sleep(random.uniform(0.02, 0.06))
 
     def _release_right(self):
         if not self.right_held:
             return
         self.right_held = False
         self.right_held_auto = False
-        mouse_right_up()
-        self.btn_right.config(text="按住右键")
-        self.status_var.set("右键已松开")
+        key = self.hold_key
+        if key == "right":
+            mouse_right_up()
+        elif HAS_KEYBOARD:
+            keyboard.release(key)
+        self.btn_right.config(text="按住键")
+        self.status_var.set(f"{key_display(key)} 已松开")
 
     # ── 收尾 ────────────────────────────────────────────────────────────────
     def _restart_as_admin(self):
@@ -1642,134 +2074,9 @@ class AutoClicker:
         else:
             messagebox.showerror(APP_NAME, "提权失败，请右键以管理员身份运行。", parent=self.root)
 
-    # --- Rotation ---
-    def _load_rotate_calibration(self):
-        try:
-            path = os.path.join(APP_DIR, "rotate_calibration.json")
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self.rotate_sensitivity = int(data.get("sensitivity", 0))
-                if self.rotate_sensitivity > 0:
-                    self.rotate_sens_label.config(text=f"\u6821\u51c6\u503c: {self.rotate_sensitivity} \u50cf\u7d20/180\u00b0")
-        except Exception:
-            pass
-
-    def _save_rotate_calibration(self):
-        try:
-            path = os.path.join(APP_DIR, "rotate_calibration.json")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({"sensitivity": self.rotate_sensitivity}, f)
-        except Exception:
-            pass
-
-    def _start_rotate_calibration(self):
-        if self.rotate_calibrating: return
-        messagebox.showinfo("\u6821\u51c6", "\u70b9\u51fb\u786e\u5b9a\u540e\uff0c\u8bf7\u7528\u9f20\u6807\u5411\u53f3\u8f6c\u52a8\u89c6\u89d2 180 \u5ea6\u3002\n\u8f6c\u5b8c\u540e\u6309\u4efb\u610f\u952e\u505c\u6b62\u3002", parent=self.root)
-        self.rotate_calibrating = True
-        self._rotate_calib_total = 0
-        self._rotate_calib_prev = None
-        self.rotate_sens_label.config(text="\u6821\u51c6\u4e2d...")
-        threading.Thread(target=self._calib_poll_worker, daemon=True).start()
-        if keyboard is not None:
-            self._rotate_kb_hook = keyboard.hook(self._on_rotate_calib_key)
-
-    def _calib_poll_worker(self):
-        # 通过 Raw Input 捕获鼠标增量（兼容游戏 Raw Input 模式）
-        wc = type('WNDCLASS', (ctypes.Structure,), {
-            '_fields_': [('style', ctypes.wintypes.UINT), ('lpfnWndProc', ctypes.c_void_p),
-                         ('cbClsExtra', ctypes.c_int), ('cbWndExtra', ctypes.c_int),
-                         ('hInstance', ctypes.wintypes.HINSTANCE), ('hIcon', ctypes.wintypes.HANDLE),
-                         ('hCursor', ctypes.wintypes.HANDLE), ('hbrBackground', ctypes.wintypes.HANDLE),
-                         ('lpszMenuName', ctypes.wintypes.LPCWSTR), ('lpszClassName', ctypes.wintypes.LPCWSTR)]
-        })()
-        wc.lpfnWndProc = ctypes.cast(user32.DefWindowProcW, ctypes.c_void_p)
-        wc.lpszClassName = "RawInputCalib"
-        wc.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
-        atom = user32.RegisterClassW(ctypes.byref(wc))
-        hwnd = user32.CreateWindowExW(0, "RawInputCalib", "Calib", 0, 0, 0, 1, 1, None, None, wc.hInstance, None)
-        if not hwnd:
-            self.rotate_calibrating = False
-            return
-        rid = RAWINPUTDEVICE()
-        rid.usUsagePage = 1; rid.usUsage = 2; rid.dwFlags = RIDEV_INPUTSINK; rid.hwndTarget = hwnd
-        RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE))
-        raw_size = ctypes.sizeof(RAWINPUT)
-        buf = ctypes.create_string_buffer(raw_size * 2)
-        msg = ctypes.wintypes.MSG()
-        while self.rotate_calibrating:
-            if user32.PeekMessageW(ctypes.byref(msg), hwnd, 0, 0, 1):
-                if msg.message == WM_INPUT:
-                    size = ctypes.wintypes.UINT(raw_size * 2)
-                    GetRawInputData(msg.lParam, RID_INPUT, ctypes.byref(buf), ctypes.byref(size), ctypes.sizeof(RAWINPUTHEADER))
-                    raw = ctypes.cast(ctypes.byref(buf), ctypes.POINTER(RAWINPUT)).contents
-                    if raw.header.dwType == RIM_TYPEMOUSE:
-                        self._rotate_calib_total += abs(raw.mouse.lLastX)
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
-            else:
-                time.sleep(0.001)
-        rid.dwFlags = 1; rid.usUsagePage = 1; rid.usUsage = 2
-        RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE))
-        user32.DestroyWindow(hwnd)
-        user32.UnregisterClassW("RawInputCalib", wc.hInstance)
-
-    def _on_rotate_calib_key(self, event):
-        if not self.rotate_calibrating: return
-        self.rotate_calibrating = False
-        if keyboard is not None:
-            try: keyboard.unhook(self._rotate_kb_hook)
-            except: pass
-        total_dx = self._rotate_calib_total
-        if total_dx < 10:
-            messagebox.showwarning("\u6821\u51c6", "\u79fb\u52a8\u8ddd\u79bb\u592a\u77ed\uff0c\u8bf7\u91cd\u8bd5\u3002", parent=self.root)
-            self.rotate_sens_label.config(text="\u672a\u6821\u51c6")
-            return
-        self.rotate_sensitivity = total_dx
-        self._save_rotate_calibration()
-        self.rotate_sens_label.config(text=f"\u6821\u51c6\u503c: {total_dx} \u50cf\u7d20/180\u00b0")
-        messagebox.showinfo("\u6821\u51c6\u5b8c\u6210", f"180\u00b0 \u5bf9\u5e94 {total_dx} \u50cf\u7d20\u9f20\u6807\u79fb\u52a8\u91cf\u3002\n\u73b0\u5728\u53ef\u4ee5\u7528\u6309\u94ae\u6216 F8 \u8f6c\u52a8\u89c6\u89d2\u3002", parent=self.root)
-
-    def _reset_rotate_calibration(self):
-        self.rotate_sensitivity = 0
-        self._save_rotate_calibration()
-        self.rotate_sens_label.config(text="\u672a\u6821\u51c6")
-
-    def _do_rotate(self):
-        if self.rotate_sensitivity <= 0:
-            messagebox.showwarning("\u89c6\u89d2\u8f6c\u52a8", "\u8bf7\u5148\u6821\u51c6\u3002", parent=self.root)
-            return
-        try: angle = int(self.rotate_angle_var.get())
-        except: angle = 180
-        total_dx = int(self.rotate_sensitivity * (angle / 180.0))
-        threading.Thread(target=self._rotate_worker, args=(total_dx,), daemon=True).start()
-
-    def _rotate_worker(self, total_dx):
-        # 分成 20-40 个大批次，每批次 dx 较大，模拟快速甩鼠标
-        batches = random.randint(20, 40)
-        weights = [random.uniform(0.5, 1.5) for _ in range(batches)]
-        w_sum = sum(weights)
-        dx_list = [max(1, int(total_dx * w / w_sum)) for w in weights]
-        dx_list[-1] += total_dx - sum(dx_list)
-        for i, dx in enumerate(dx_list):
-            dy = random.randint(-2, 2)
-            _send_mouse_input(MOUSEEVENTF_MOVE, dx=dx, dy=dy)
-            # 间隔极短，模拟高速甩枪
-            time.sleep(random.uniform(0.001, 0.004))
-
-    def _register_rotate_hotkey(self):
-        if keyboard is None: return
-        key = getattr(self, "_rotate_hotkey_name", "f8")
-        try:
-            if self._rotate_hotkey_handle:
-                keyboard.remove_hotkey(self._rotate_hotkey_handle)
-            self._rotate_hotkey_handle = keyboard.add_hotkey(key, lambda: self.ui_queue.put(("rotate", None)), suppress=False)
-        except: pass
-
     def _on_close(self):
         try:
             self.running = False
-            self.rotate_calibrating = False
             self._release_right()
             self._unregister_hotkey()
             if keyboard is not None:
@@ -1803,12 +2110,18 @@ def run_selftest():
         f"数据文件可写：{'是' if os.access(os.path.dirname(CONFIG_PATH), os.W_OK) else '否'}",
         f"方案数量：{len(cfg['profiles'])}（{', '.join(cfg['profiles'].keys())}）",
         f"键盘库 keyboard：{'可用' if HAS_KEYBOARD else '不可用'}",
-        "热键：启停 {} / 按住右键 {} / 运行开始时同步按住右键：{}".format(
+        "热键：启停 {} / 按住键 {}({}) / 运行开始时同步按住键：{}".format(
             key_display(cfg["profiles"][cfg["current_profile"]]["hotkey"]),
+            key_display(cfg["profiles"][cfg["current_profile"]].get("hold_key", "right")),
             key_display(cfg["profiles"][cfg["current_profile"]]["right_hotkey"]),
             "是" if cfg["profiles"][cfg["current_profile"]]["auto_right_hold"] else "否"),
         f"管理员权限：{'是' if is_admin() else '否'}",
         f"Tcl/Tk 运行库：{TCL_RUNTIME or '使用系统自带（源码运行）'}",
+        f"OCR Pillow：{'可用' if HAS_PIL_OCR else '不可用'}",
+        f"OCR pytesseract：{'可用' if HAS_PYTesseract_OCR else '不可用'}",
+        f"Tesseract：{resolve_tesseract() or '未找到'}",
+        f"Tessdata：{resolve_tessdata(resolve_tesseract()) or '未找到'}",
+        f"Boss 卡计数模式：{'可用' if ocr_available() else '不可用（不影响自由循环）'}",
         f"Python：{sys.version.split()[0]}",
     ]
     text = "\n".join(lines)

@@ -9,7 +9,7 @@
 
 **直接下载最新版 exe：** 👉 [ Releases 页面](https://github.com/xyz0218xy-ops/auto-clicker/releases/latest)
 
-> 双击运行即可，无需安装 Python。建议右键「以管理员身份运行」。
+> 从 Releases 页面下载 `AutoClicker.exe`，无需安装 Python。建议右键「以管理员身份运行」。
 
 ## 功能
 
@@ -17,6 +17,8 @@
 - **采集按键**：按下任意键即绑定
 - **多方案管理**：新建 / 复制 / 重命名 / 删除
 - **按住右键**：按钮或热键（默认 F8）随时开关
+- **Boss 卡计数模式**：OCR 识别 Boss 卡右下角数量，按设定次数召唤后自动停止
+- **进度保存**：计数进度随方案保存，下次启动可继续查看
 - **间隔随机化**：默认 0.5 ~ 2.0 倍随机
 - **相对偏移**：鼠标项可填相对偏移量
 - **轮次间隔**：每轮循环间可单独设置等待
@@ -27,8 +29,11 @@
 
 详见 [CHANGELOG.md](CHANGELOG.md)
 
-### 最新 v26 (2026-09-22)
-- 修复 Tcl/Tk DLL 版本不匹配导致管理员运行崩溃
+### 最新 v29 (2026-10-05)
+- 新增 Boss 卡 OCR 计数模式，支持自定义召唤次数
+- 新增任意键按住，同时保留鼠标右键按住
+- 修复 OCR `tessdata` 路径、Tcl/Tk 打包和固定坐标点击问题
+- 打包内置 Tesseract、`tessdata`、`keyboard`、Pillow、pytesseract
 
 ## 快速开始
 
@@ -40,7 +45,7 @@
 ## 打包
 
 ```powershell
-python -m pip install keyboard pyinstaller
+python -m pip install keyboard pyinstaller pillow pytesseract
 powershell -ExecutionPolicy Bypass -File outputs\build_exe.ps1
 ```
 
@@ -48,3 +53,4 @@ powershell -ExecutionPolicy Bypass -File outputs\build_exe.ps1
 
 - 本工具仅用于合法的自动化测试场景，请确认使用行为符合目标软件的用户协议。
 - 本工具通过软件层模拟输入（SendInput），不涉及游戏进程注入或内存修改。
+- 本工具不提供、不宣传反作弊或游戏检测绕过功能。

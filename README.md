@@ -1,4 +1,4 @@
-﻿# 自动点击器（Windows 鼠标 / 键盘自动化工具）
+# 自动点击器（Windows 鼠标 / 键盘自动化工具）
 
 [![GitHub release](https://img.shields.io/github/v/release/xyz0218xy-ops/auto-clicker?style=flat-square)](https://github.com/xyz0218xy-ops/auto-clicker/releases)
 [![GitHub downloads](https://img.shields.io/github/downloads/xyz0218xy-ops/auto-clicker/total?style=flat-square)](https://github.com/xyz0218xy-ops/auto-clicker/releases)
@@ -7,9 +7,9 @@
 
 ## 下载
 
-**直接下载最新版 exe：** 👉 [ Releases 页面](https://github.com/xyz0218xy-ops/auto-clicker/releases/latest)
+**直接下载最新版 exe：** 👉 [AutoClicker-v36.exe](https://github.com/xyz0218xy-ops/auto-clicker/releases/download/v36/AutoClicker-v36.exe)
 
-> 从 Releases 页面下载 `AutoClicker.exe`，无需安装 Python。建议右键「以管理员身份运行」。
+> 无需安装 Python，建议右键「以管理员身份运行」。历史版本与更新公告见 [Releases 页面](https://github.com/xyz0218xy-ops/auto-clicker/releases)。
 
 ## 功能
 
@@ -29,26 +29,18 @@
 
 详见 [CHANGELOG.md](CHANGELOG.md)
 
-### 最新 v35 (2026-10-05)
-- 修复点“开始”无法启动：启动第一步抛异常，开始按钮和热键启停全部失效
-- 修复热键设置/启停整体失效：异常曾导致界面消息队列停摆
-- 修复右方向键做启停热键时被跳过
-- 恢复“打开等待”输入框，可手动调整召唤界面等待
-- 出错时状态栏提示并写入 debug.log，方便反馈问题
-- 召唤界面打开后改为轮询等待数量区域稳定，不再过早读取
-- 状态栏明确显示“已唤出召唤界面”和数量重试进度
-- 自由循环模式保持不变
-- 优化 Boss 卡 OCR 识别：增加多组预处理、多种分割模式和召唤后重试
-- 降低误读概率，数量识别不稳定时不会立即重复点击
-- 保留 v29 的 Boss 卡计数模式、任意键按住和内置 OCR 打包
-- 新增 Boss 卡 OCR 计数模式，支持自定义召唤次数
-- 新增任意键按住，同时保留鼠标右键按住
-- 修复 OCR `tessdata` 路径、Tcl/Tk 打包和固定坐标点击问题
-- 打包内置 Tesseract、`tessdata`、`keyboard`、Pillow、pytesseract
+### 最新 v36 (2026-10-05)
+- Boss 卡数量识别换成三层混合引擎：自学习模板 → Windows OCR → Tesseract 兜底，常规 50~150ms 出结果
+- 新增「学习数字」按钮与「测试读取」三层耗时显示
+- 修复卡在「核对召唤后数量」：最多约 2 秒快速核对，读不到按已消耗 1 张继续并提示
+- 计数模式启动时预热识别引擎，消除首次 2~3 秒冷启动
+- 打包内置精简 Tesseract、WinRT OCR、keyboard、Pillow、pytesseract
+- 自由循环模式、全部热键、按住任意键功能不变
+- 更新公告详见 [release-notes-v36.md](release-notes-v36.md)
 
 ## 快速开始
 
-1. 从 [Releases](https://github.com/xyz0218xy-ops/auto-clicker/releases/latest) 下载 exe
+1. 下载 [AutoClicker-v36.exe](https://github.com/xyz0218xy-ops/auto-clicker/releases/download/v36/AutoClicker-v36.exe)
 2. 点「采集点击」→ 3 秒内把鼠标移到目标位置
 3. 按 F12 开始 / 停止
 4. 建议右键「以管理员身份运行」

@@ -148,12 +148,19 @@ from count_mode import (
     CountSafetyError,
     HAS_PIL as HAS_PIL_OCR,
     HAS_PYTesseract as HAS_PYTesseract_OCR,
+    engine_status,
+    learn_templates,
     ocr_available,
     parse_region,
-    read_count_once,
-    read_count_stable,
+    probe_winrt_ocr,
+    read_count_debug,
+    read_count_quick,
+    read_tesseract,
     resolve_tesseract,
     resolve_tessdata,
+    set_template_dir,
+    template_stats,
+    warm_up_ocr,
 )
 
 # ── 可选依赖：键盘钩子与按键模拟 ────────────────────────────────────────────
@@ -167,7 +174,7 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v35"
+APP_VERSION = "v36"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -337,6 +344,9 @@ def choose_config_path():
 
 
 CONFIG_PATH = choose_config_path()
+
+# 数字识别模板与配置放在同一目录，保证换电脑时模板跟着数据一起迁移
+set_template_dir(os.path.join(os.path.dirname(CONFIG_PATH), "count_templates"))
 
 
 # ── 配置读写（原子写入 + 自动备份，防止意外断电写坏数据） ──────────────────
@@ -985,6 +995,8 @@ class AutoClicker:
         ttk.Label(count_ocr, text="测试读取").pack(side=tk.LEFT, padx=(8, 2))
         ttk.Button(count_ocr, text="读取一次", width=9,
                    command=self._test_count_ocr).pack(side=tk.LEFT)
+        ttk.Button(count_ocr, text="学习数字", width=9,
+                   command=self._learn_count_templates).pack(side=tk.LEFT, padx=3)
         ttk.Button(count_ocr, text="重置进度", width=9,
                    command=self._reset_count_progress).pack(side=tk.LEFT, padx=3)
 
@@ -1624,15 +1636,16 @@ class AutoClicker:
 
     def _test_count_ocr(self):
         region = self._current_count_region()
+        status = engine_status()
         if not ocr_available():
             missing = []
             if not HAS_PIL_OCR:
                 missing.append("Pillow")
+            if not status["winrt"]:
+                missing.append("Windows OCR")
             if not HAS_PYTesseract_OCR:
                 missing.append("pytesseract")
-            if not resolve_tesseract():
-                missing.append("Tesseract")
-            elif not resolve_tessdata(resolve_tesseract()):
+            if not status["tesseract"]:
                 missing.append("Tesseract 语言包")
             self.count_ocr_status_var.set("OCR：" + ("、".join(missing) + " 缺失" if missing else "不可用"))
             messagebox.showwarning(
@@ -1640,13 +1653,60 @@ class AutoClicker:
                 "OCR 当前不可用，自由模式不受影响。\n缺失组件：" + "、".join(missing or ["未知"]),
                 parent=self.root)
             return
-        value = read_count_once(region)
-        if value is None:
-            self.count_ocr_status_var.set("OCR：读取失败")
-            self.status_var.set("数量识别失败，请检查区域、分辨率和 Tesseract 语言包")
+        self.count_ocr_status_var.set("OCR：识别中……")
+        self.status_var.set("正在三层识别 Boss 卡数量……")
+        info = read_count_debug(region, command=status["tesseract_path"], tessdata_dir=status["tessdata"])
+        parts = [
+            f"模板：{info['template_value']}（{info['template_ms']:.0f}ms）",
+            f"WinOCR：{info['winocr_value']}（{info['winocr_ms']:.0f}ms）",
+            f"Tesseract：{info['tesseract_value']}（{info['tesseract_ms']:.0f}ms）",
+        ]
+        if info["value"] is not None:
+            self.count_ocr_status_var.set(f"OCR：{info['value']}（{info['layer']}，{info['total_ms']:.0f}ms）")
+            self.status_var.set("识别成功：" + "，".join(parts) + f"，总耗时 {info['total_ms']:.0f}ms")
         else:
-            self.count_ocr_status_var.set(f"OCR：{value}")
-            self.status_var.set(f"数量识别成功：{value}")
+            self.count_ocr_status_var.set("OCR：读取失败")
+            self.status_var.set("三层识别均失败：" + "，".join(parts) + "（可点「学习数字」后再试）")
+
+    def _learn_count_templates(self):
+        """打开召唤界面后点击：采集约 5 帧，自动学习 0-9 数字模板（后台执行）。"""
+        if getattr(self, "count_learning", False):
+            messagebox.showinfo(APP_NAME, "正在学习中，请保持召唤界面显示并稍候。", parent=self.root)
+            return
+        region = self._current_count_region()
+        status = engine_status()
+        if not ocr_available():
+            messagebox.showwarning(
+                APP_NAME,
+                "OCR 引擎不可用，无法自动标注数字。\n请先安装 Pillow 与 Windows OCR / Tesseract。",
+                parent=self.root)
+            return
+        self.count_learning = True
+
+        def worker():
+            try:
+                self.ui_queue.put(("status", "正在学习数字模板（请保持召唤界面显示）……"))
+                learned = learn_templates(
+                    region, frames=5, delay=0.25,
+                    command=status["tesseract_path"], tessdata_dir=status["tessdata"],
+                    callback=lambda frame, current: self.ui_queue.put(
+                        ("status", f"正在学习数字模板 {frame}/5：已采集 {sum(current.values())} 张"))
+                )
+                stats = template_stats()
+                covered = sum(1 for digit in range(10) if stats[digit] > 0)
+                total = sum(learned.values())
+                message = f"数字学习完成：本次新增 {total} 张模板，已覆盖 {covered}/10 个数字"
+                if covered < 10:
+                    message += "（可多次点击补齐）"
+                self.ui_queue.put(("ocr_status", f"模板：覆盖 {covered}/10"))
+                self.ui_queue.put(("status", message))
+            except Exception:
+                self._log_error("学习数字模板失败")
+                self.ui_queue.put(("ocr_status", "OCR：学习失败"))
+            finally:
+                self.count_learning = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _reset_count_progress(self):
         self.count_progress = 0
@@ -1948,6 +2008,14 @@ class AutoClicker:
         except Exception:
             pass
 
+    def _log_debug(self, message):
+        """把运行细节写入 debug.log，便于排查计数核对等非异常问题。"""
+        try:
+            with open(os.path.join(APP_DIR, "debug.log"), "a", encoding="utf-8") as fh:
+                fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
+        except Exception:
+            pass
+
     def _pump_queue(self):
         try:
             while True:
@@ -1980,6 +2048,8 @@ class AutoClicker:
             self.count_progress = max(0, int(message[1]))
             self.count_progress_var.set(f"进度 {self.count_progress} / {self.count_target}")
             self._save_now()
+        elif kind == "ocr_status":
+            self.count_ocr_status_var.set(message[1])
         elif kind == "error":
             messagebox.showerror(APP_NAME, message[1], parent=self.root)
         elif kind == "key":
@@ -2015,7 +2085,7 @@ class AutoClicker:
             if not ocr_available():
                 messagebox.showwarning(
                     APP_NAME,
-                    "Boss 卡计数模式需要 Pillow、pytesseract 和 Tesseract。\n"
+                    "Boss 卡计数模式需要 OCR 组件（Pillow + Windows OCR 或 Tesseract）。\n"
                     "当前 OCR 不可用；自由循环模式仍可使用。",
                     parent=self.root)
                 return
@@ -2116,50 +2186,91 @@ class AutoClicker:
         self.count_auto_next = bool(self.count_auto_next_var.get())
         self.count_progress_var.set(f"进度 {self.count_progress} / {self.count_target}")
 
+    def _expand_region_to_screen(self, region, pad=12):
+        """识别区域四周各扩展 pad 像素并限制在屏幕内，防止 6 位数字被裁掉。"""
+        x, y, width, height = parse_region(region, DEFAULT_COUNT_REGION)
+        screen_width = user32.GetSystemMetrics(0) or 1920
+        screen_height = user32.GetSystemMetrics(1) or 1080
+        left = max(0, x - pad)
+        top = max(0, y - pad)
+        right = min(screen_width, x + width + pad)
+        bottom = min(screen_height, y + height + pad)
+        return (left, top, right - left, bottom - top)
+
     def _run_count_mode(self):
-        """安全计数状态机：稳定 OCR → 点击 → 等待变化 → 确认一次消耗。"""
+        """计数状态机：快速三层识别 → 点击 → 约 2 秒快速核对，读不到按消耗 1 张继续。"""
         summon = self.count_summon_point
         boss_card = self.count_boss_card_point
-        region = parse_region(self.count_ocr_region, DEFAULT_COUNT_REGION)
+        region = self._expand_region_to_screen(self.count_ocr_region)
         guard = CountGuard(self.count_target, self.count_progress)
         command = resolve_tesseract()
         tessdata_dir = resolve_tessdata(command)
+
+        # 后台预热 OCR 引擎，消除首次调用约 1-3 秒的冷启动延迟
+        self._set_status("正在预热 OCR 引擎……")
+        warm_ms = warm_up_ocr(region, command=command, tessdata_dir=tessdata_dir)
+        self._set_status(f"OCR 引擎预热完成（{warm_ms:.0f} ms）")
+
+        verify_timeout = max(1.0, min(2.0, self.count_post_click_wait))
         while self.running and not guard.reached:
-            self._set_status(f"计数模式：等待召唤界面（进度 {guard.progress}/{guard.target}）")
+            self._set_status(
+                f"计数模式：按下 {key_display(self.count_open_key)} 唤出召唤界面"
+                f"（进度 {guard.progress}/{guard.target}）")
             if not key_tap(self.count_open_key):
                 raise CountSafetyError(f"唤出键 {key_display(self.count_open_key)} 执行失败")
-            self._set_status(f"已唤出召唤界面，正在读取 Boss 卡数量……")
+            self._sleep_interruptible(self.count_open_wait)
+
+            # 读前数量：单次三层读取（约 100ms 内），失败最多快速重试 3 次
             before = None
-            stable_count = 0
-            for attempt in range(4):
-                self._sleep_interruptible(self.count_open_wait if attempt == 0 else 0.5)
-                before, stable_count, _raw = read_count_stable(
-                    region, samples=5, delay=0.12, command=command, tessdata_dir=tessdata_dir)
+            self._set_status("已唤出召唤界面，正在读取 Boss 卡数量……")
+            for attempt in range(3):
+                before, _used, _raw = read_count_quick(
+                    region, attempts=1, command=command, tessdata_dir=tessdata_dir)
                 if before is not None:
                     break
-                self._set_status(f"召唤界面数量区域尚未稳定，正在重试（{attempt + 1}/4）")
+                self._set_status(f"数量区域读取失败，正在重试（{attempt + 1}/3）")
+                self._sleep_interruptible(0.2)
             if before is None:
-                raise CountSafetyError(f"召唤界面数量区域无法识别（连续稳定读取 {stable_count} 次）")
-            self._set_status(f"OCR 识别到当前数量：{before}")
+                raise CountSafetyError("召唤界面数量区域无法识别，已停止（请检查数量区域，或先点「学习数字」）")
+            self._set_status(f"识别到当前数量：{before}")
+
             mouse_click_left(int(boss_card["x"]), int(boss_card["y"]), jitter=False)
             self._sleep_interruptible(random.uniform(0.12, 0.24))
             mouse_click_left(int(summon["x"]), int(summon["y"]), jitter=False)
             self._sleep_interruptible(self.count_post_click_wait)
+
+            # 召唤后快速核对：识别到下降立即确认；读不到最多约 2 秒后按消耗 1 张继续
             after = None
-            stable_count = 0
-            for _attempt in range(4):
-                self._set_status("正在确认召唤后的数量变化……")
-                after, stable_count, _raw = read_count_stable(
-                    region, samples=5, delay=0.12, command=command, tessdata_dir=tessdata_dir)
-                if after is not None and after < before:
+            last_read = None
+            deadline = time.time() + verify_timeout
+            attempt = 0
+            while True:
+                attempt += 1
+                after, _used, _raw = read_count_quick(
+                    region, attempts=1, command=command, tessdata_dir=tessdata_dir)
+                if after is not None:
+                    last_read = after
+                    self._set_status(f"核对第 {attempt} 次：读到 {after}（召唤前 {before}）")
+                    if after < before:
+                        break
+                else:
+                    self._set_status(f"核对第 {attempt} 次：未读到，继续等待")
+                if time.time() >= deadline:
                     break
-                self._sleep_interruptible(0.5)
-            if after is None:
-                raise CountSafetyError(f"召唤后 OCR 不稳定（连续稳定读取 {stable_count} 次）")
-            progress = guard.confirm(before, after)
+                self._sleep_interruptible(0.25)
+
+            old_progress = guard.progress
+            progress, note = guard.confirm(before, after)
+            delta = max(1, progress - old_progress)
             self.count_progress = progress
-            self._set_status(f"已确认消耗 1 张：{before} → {after}，进度 {progress}/{guard.target}")
             self.ui_queue.put(("count_progress", progress))
+            self._set_status(
+                f"本轮完成：{before} → {after if after is not None else '?'}，{note}，"
+                f"进度 {progress}/{guard.target}")
+            if after is None:
+                self._log_debug(
+                    f"计数核对超时：before={before} after=None 最后读到={last_read} "
+                    f"note={note} progress={progress} delta={delta}")
             if guard.reached:
                 self._set_status(f"计数完成：已召唤 {progress} 次，自动停止")
                 break
@@ -2303,6 +2414,9 @@ def main():
 def run_selftest():
     """自检：把运行环境信息写入程序同目录的 selftest.txt，方便排查问题。"""
     cfg = load_config(CONFIG_PATH)
+    ocr_status = engine_status()
+    template_text = ", ".join(
+        f"{digit}:{count}" for digit, count in ocr_status["templates"].items() if count) or "无（建议先点「学习数字」）"
     lines = [
         f"{APP_NAME} {APP_VERSION}",
         f"程序目录：{APP_DIR}",
@@ -2320,11 +2434,34 @@ def run_selftest():
         f"Tcl/Tk 运行库：{TCL_RUNTIME or '使用系统自带（源码运行）'}",
         f"OCR Pillow：{'可用' if HAS_PIL_OCR else '不可用'}",
         f"OCR pytesseract：{'可用' if HAS_PYTesseract_OCR else '不可用'}",
+        f"OCR WinRT（Windows 自带）：{'可用' if ocr_status['winrt'] else '不可用'}",
         f"Tesseract：{resolve_tesseract() or '未找到'}",
         f"Tessdata：{resolve_tessdata(resolve_tesseract()) or '未找到'}",
+        f"OCR 数字模板目录：{ocr_status['template_dir']}",
+        f"OCR 数字模板：{template_text}",
         f"Boss 卡计数模式：{'可用' if ocr_available() else '不可用（不影响自由循环）'}",
         f"Python：{sys.version.split()[0]}",
     ]
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        sample = Image.new("L", (260, 70), 255)
+        draw = ImageDraw.Draw(sample)
+        try:
+            font = ImageFont.truetype("C:/Windows/Fonts/consola.ttf", 44)
+        except Exception:
+            font = ImageFont.load_default()
+        draw.text((8, 6), "123456", fill=0, font=font)
+        win_value, win_ms = probe_winrt_ocr(sample)
+        lines.append("WinRT 实测：识别 {} 耗时 {:.0f}ms".format(
+            win_value if win_value is not None else "失败", win_ms))
+        tes_started = time.perf_counter()
+        tes_value = read_tesseract(sample)
+        tes_ms = (time.perf_counter() - tes_started) * 1000
+        lines.append("Tesseract 实测：识别 {} 耗时 {:.0f}ms".format(
+            tes_value if tes_value is not None else "失败", tes_ms))
+    except Exception as exc:
+        lines.append(f"OCR 实测跳过：{exc}")
     text = "\n".join(lines)
     output = os.path.join(APP_DIR, "selftest.txt")
     try:

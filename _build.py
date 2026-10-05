@@ -1,68 +1,163 @@
 # -*- coding: utf-8 -*-
-"""复制 Tcl/Tk 并删除冲突的 demos 目录，然后运行 PyInstaller 打包。"""
+"""打包脚本：复制 Tcl/Tk 运行库、暂存 Tesseract 最小依赖，然后运行 PyInstaller 生成单文件 exe。
+
+Tcl/Tk：必须显式打包 tcl8.6 / tk8.6 目录、tcl86t.dll、tk86t.dll 与 _tkinter.pyd，
+否则打包后界面会报 init.tcl 版本不匹配或找不到可用 Tcl/Tk。
+Tesseract：用 pefile 分析 tesseract.exe 的 DLL 导入闭包，只暂存实际需要的
+DLL + eng.traineddata，避免把 150MB 无关 DLL 全部塞进 exe。
+"""
 import os
 import shutil
 import subprocess
 import sys
 
+try:
+    import pefile
+except ImportError:
+    pefile = None
+
+APP_VERSION = "v36"
 PYTHON = r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\python.exe"
 TCL_SRC = r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\tcl"
+DLL_SRC = r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\DLLs"
+TESS_SRC = r"C:\Program Files\Tesseract-OCR"
 WORK_DIR = r"C:\Users\A\Documents\Codex\auto-clicker"
 OUTPUTS = os.path.join(WORK_DIR, "outputs")
 TEMP_TCL = os.path.join(WORK_DIR, "_temp_tcl")
+TESS_STAGE = os.path.join(WORK_DIR, "work", "tesseract-stage")
 DIST_DIR = os.path.join(OUTPUTS, "dist")
 BUILD_DIR = os.path.join(WORK_DIR, "work", "build")
 SPEC_DIR = os.path.join(WORK_DIR, "work", "spec")
 PICACHE = os.path.join(WORK_DIR, "work", "picache")
+EXE_NAME = f"AutoClicker-{APP_VERSION}"
 
-# 清理临时目录
-if os.path.exists(TEMP_TCL):
-    shutil.rmtree(TEMP_TCL)
-print("复制 Tcl/Tk 到临时目录...")
-shutil.copytree(TCL_SRC, TEMP_TCL)
 
-# 删除 tk8.6\demos（大小写冲突导致 PyInstaller 解压失败）
-demos_dir = os.path.join(TEMP_TCL, "tk8.6", "demos")
-if os.path.exists(demos_dir):
-    shutil.rmtree(demos_dir)
-    print("已删除 tk8.6/demos")
+def stage_tcl():
+    """复制 Tcl/Tk 到临时目录并删除冲突的 demos 目录。"""
+    if os.path.exists(TEMP_TCL):
+        shutil.rmtree(TEMP_TCL)
+    print("复制 Tcl/Tk 到临时目录 ...")
+    shutil.copytree(TCL_SRC, TEMP_TCL)
+    demos_dir = os.path.join(TEMP_TCL, "tk8.6", "demos")
+    if os.path.exists(demos_dir):
+        shutil.rmtree(demos_dir)
+        print("已删除 tk8.6/demos")
 
-# 设置环境变量
-os.environ["PYINSTALLER_CONFIG_DIR"] = PICACHE
 
-# 构建 PyInstaller 命令
-cmd = [
-    PYTHON, "-m", "PyInstaller",
-    "--onefile", "--windowed",
-    "--name", "AutoClicker",
-    "--add-data", f"{os.path.join(TEMP_TCL, 'tcl8.6')};tcl/tcl8.6",
-    "--add-data", f"{os.path.join(TEMP_TCL, 'tk8.6')};tk/tk8.6",
-    "--add-binary", r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\DLLs\tcl86t.dll;.",
-    "--add-binary", r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\DLLs\tk86t.dll;.",
-    "--distpath", DIST_DIR,
-    "--workpath", BUILD_DIR,
-    "--specpath", SPEC_DIR,
-    "--noconfirm",
-    os.path.join(OUTPUTS, "auto_clicker.py"),
-]
+def _dll_imports(path):
+    """读取 PE 文件的导入 DLL 列表。"""
+    pe = pefile.PE(path, fast_load=True)
+    pe.parse_data_directories(directories=[
+        pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+    return [entry.dll.decode(errors="ignore")
+            for entry in (getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) or [])]
 
-print("开始打包...")
-print(" ".join(cmd))
-result = subprocess.run(cmd, cwd=WORK_DIR)
-if result.returncode != 0:
-    print(f"打包失败，返回码: {result.returncode}")
-    sys.exit(1)
 
-# 重命名
-src = os.path.join(DIST_DIR, "AutoClicker.exe")
-dst = os.path.join(DIST_DIR, "自动点击器.exe")
-if os.path.exists(src):
-    if os.path.exists(dst):
-        os.remove(dst)
-    os.rename(src, dst)
-    size_mb = os.path.getsize(dst) / 1024 / 1024
-    print(f"打包完成: {dst} ({size_mb:.1f} MB)")
+def stage_tesseract():
+    """暂存 tesseract.exe + 依赖闭包 DLL + eng.traineddata，返回暂存目录或 None。"""
+    if not os.path.isdir(TESS_SRC):
+        print("未找到 Tesseract 安装目录，跳过捆绑（程序会回退到系统 Tesseract / WinRT）。")
+        return None
+    if pefile is None:
+        print("缺少 pefile，跳过 Tesseract 捆绑（程序会回退到系统 Tesseract / WinRT）。")
+        return None
+    if os.path.exists(TESS_STAGE):
+        shutil.rmtree(TESS_STAGE)
+    os.makedirs(TESS_STAGE)
+    seen, files = set(), []
 
-# 清理临时目录
-shutil.rmtree(TEMP_TCL, ignore_errors=True)
-print("临时目录已清理")
+    def walk(path):
+        name = os.path.basename(path).lower()
+        if name in seen:
+            return
+        seen.add(name)
+        files.append(name)
+        for dep in _dll_imports(path):
+            dep_low = dep.lower()
+            if dep_low.startswith(("api-ms-", "ext-ms-")):
+                continue
+            candidate = os.path.join(TESS_SRC, dep)
+            if os.path.exists(candidate):
+                walk(candidate)
+
+    walk(os.path.join(TESS_SRC, "tesseract.exe"))
+    for name in files:
+        shutil.copy2(os.path.join(TESS_SRC, name), os.path.join(TESS_STAGE, name))
+    os.makedirs(os.path.join(TESS_STAGE, "tessdata"))
+    shutil.copy2(
+        os.path.join(TESS_SRC, "tessdata", "eng.traineddata"),
+        os.path.join(TESS_STAGE, "tessdata", "eng.traineddata"),
+    )
+    size_mb = sum(
+        os.path.getsize(os.path.join(TESS_STAGE, name)) for name in files
+    ) / 1024 / 1024
+    print(f"Tesseract 暂存完成：{len(files)} 个文件（约 {size_mb:.0f} MB）+ eng.traineddata")
+    return TESS_STAGE
+
+
+def main():
+    stage_tcl()
+    tesseract_stage = stage_tesseract()
+
+    os.environ["PYINSTALLER_CONFIG_DIR"] = PICACHE
+
+    cmd = [
+        PYTHON, "-m", "PyInstaller",
+        "--onefile", "--windowed",
+        "--name", EXE_NAME,
+        "--add-data", f"{os.path.join(TEMP_TCL, 'tcl8.6')};tcl/tcl8.6",
+        "--add-data", f"{os.path.join(TEMP_TCL, 'tk8.6')};tk/tk8.6",
+        "--add-binary", os.path.join(DLL_SRC, "tcl86t.dll") + ";.",
+        "--add-binary", os.path.join(DLL_SRC, "tk86t.dll") + ";.",
+        "--add-binary", os.path.join(DLL_SRC, "_tkinter.pyd") + ";.",
+        "--hidden-import", "keyboard",
+        "--hidden-import", "PIL",
+        "--hidden-import", "PIL.Image",
+        "--hidden-import", "PIL.ImageGrab",
+        "--hidden-import", "PIL.ImageOps",
+        "--hidden-import", "PIL.ImageFilter",
+        "--hidden-import", "pytesseract",
+        "--hidden-import", "winrt.windows.media.ocr",
+        "--hidden-import", "winrt.windows.graphics.imaging",
+        "--hidden-import", "winrt.windows.storage.streams",
+        "--hidden-import", "winrt.windows.globalization",
+        "--hidden-import", "winrt.windows.foundation",
+        "--hidden-import", "winrt.windows.foundation.collections",
+        "--collect-submodules", "winrt",
+        "--distpath", DIST_DIR,
+        "--workpath", BUILD_DIR,
+        "--specpath", SPEC_DIR,
+        "--noconfirm",
+        os.path.join(OUTPUTS, "auto_clicker.py"),
+    ]
+    if tesseract_stage:
+        insert_at = cmd.index("--distpath")
+        cmd[insert_at:insert_at] = ["--add-data", f"{tesseract_stage};tesseract"]
+
+    print("开始打包 ...")
+    print(" ".join(cmd))
+    result = subprocess.run(cmd, cwd=WORK_DIR)
+    if result.returncode != 0:
+        print(f"打包失败，返回码: {result.returncode}")
+        sys.exit(1)
+
+    exe_path = os.path.join(DIST_DIR, f"{EXE_NAME}.exe")
+    if not os.path.exists(exe_path):
+        print("打包失败：未生成 exe")
+        sys.exit(1)
+    size_mb = os.path.getsize(exe_path) / 1024 / 1024
+    print(f"打包完成: {exe_path} ({size_mb:.1f} MB)")
+
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    desktop_path = os.path.join(desktop, f"{EXE_NAME}.exe")
+    shutil.copy2(exe_path, desktop_path)
+    print(f"已复制到桌面: {desktop_path}")
+
+    shutil.rmtree(TEMP_TCL, ignore_errors=True)
+    if tesseract_stage:
+        shutil.rmtree(TESS_STAGE, ignore_errors=True)
+    print("临时目录已清理")
+
+
+if __name__ == "__main__":
+    main()

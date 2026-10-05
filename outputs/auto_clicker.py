@@ -166,7 +166,7 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v31"
+APP_VERSION = "v32"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -574,11 +574,59 @@ def vk_to_name(vk):
         return None
     if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:   # 0-9 / A-Z
         return chr(vk).lower()
-    if 0x60 <= vk <= 0x69:                          # 小键盘数字
-        return "num %d" % (vk - 0x60)
     if 0x70 <= vk <= 0x87:                          # F1-F24
         return "f%d" % (vk - 0x6F)
+    if 0x41 <= vk <= 0x5A:
+        return chr(vk).lower()
+    if 0x30 <= vk <= 0x39:
+        return chr(vk)
+    if 0x60 <= vk <= 0x69:
+        return "num %d" % (vk - 0x60)
+    if vk == 0x20:
+        return "space"
     return _VK_NAMES.get(vk)
+
+
+def key_name_to_vk(name):
+    """把常用键名转换为 Windows 虚拟键码，用于键盘钩子失效时的轮询兜底。"""
+    raw = str(name or "").strip().lower()
+    if raw.isdigit():
+        return ord(raw)
+    normalized = normalize_key_name(name)
+    if not normalized:
+        return None
+    special = {
+        "backspace": 0x08, "tab": 0x09, "enter": 0x0D, "shift": 0x10,
+        "ctrl": 0x11, "alt": 0x12, "caps lock": 0x14, "esc": 0x1B,
+        "space": 0x20, "page up": 0x21, "page down": 0x22, "end": 0x23,
+        "home": 0x24, "left": 0x25, "up": 0x26, "right": 0x27, "down": 0x28,
+        "insert": 0x2D, "delete": 0x2E,
+        "left shift": 0xA0, "right shift": 0xA1, "left ctrl": 0xA2,
+        "right ctrl": 0xA3, "left alt": 0xA4, "right alt": 0xA5,
+    }
+    if normalized in special:
+        return special[normalized]
+    if len(normalized) == 1 and normalized.isalpha():
+        return ord(normalized.upper())
+    if len(normalized) == 1 and normalized.isdigit():
+        return ord(normalized)
+    if normalized.startswith("f") and normalized[1:].isdigit():
+        number = int(normalized[1:])
+        if 1 <= number <= 24:
+            return 0x70 + number - 1
+    if normalized.startswith("num "):
+        number = normalized[4:]
+        if number.isdigit() and 0 <= int(number) <= 9:
+            return 0x60 + int(number)
+    return None
+
+
+def key_is_pressed(name):
+    """读取键盘当前状态，供热键钩子失效时使用。"""
+    vk = key_name_to_vk(name)
+    if not vk:
+        return False
+    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
 
 def normalize_key_name(value):
@@ -594,7 +642,7 @@ def normalize_key_name(value):
     if text in _KEY_ALIASES:
         return _KEY_ALIASES[text]
     if lowered.isdigit():
-        return vk_to_name(int(lowered))
+        return lowered
     return lowered
 
 
@@ -738,6 +786,9 @@ class AutoClicker:
         self.right_thread = None
         self.capturing = False
         self.ui_queue = queue.Queue()
+        self._hotkey_poll_stop = threading.Event()
+        self._hotkey_poll_state = {"hotkey": False, "right_hotkey": False}
+        self._last_hotkey_trigger = 0.0
 
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
@@ -749,6 +800,8 @@ class AutoClicker:
         self._load_profile(self.current_profile)
         self._register_hotkey()
         self._save_now()
+        self._hotkey_poll_thread = threading.Thread(target=self._hotkey_poll_loop, daemon=True)
+        self._hotkey_poll_thread.start()
         self.root.after(60, self._pump_queue)
 
     def _center_window(self, width, height):
@@ -1652,21 +1705,25 @@ class AutoClicker:
 
     def _key_read_worker(self):
         name = None
-        try:
-            while True:
-                event = keyboard.read_event(suppress=False)
-                if getattr(event, "event_type", "down") == "down":
-                    name = event.name
-                    break
-        except Exception as exc:
-            self.ui_queue.put(("error", f"读取按键失败：{exc}"))
+        deadline = time.time() + 15
+        while self.capturing and time.time() < deadline:
+            for vk in range(1, 256):
+                if user32.GetAsyncKeyState(vk) & 0x8000:
+                    name = vk_to_name(vk)
+                    if name:
+                        while self.capturing and (user32.GetAsyncKeyState(vk) & 0x8000):
+                            time.sleep(0.02)
+                        break
+            if name:
+                break
+            time.sleep(0.02)
         self.ui_queue.put(("key", name, getattr(self, "_key_target", None)))
 
     def _handle_key_captured(self, name, target):
         self.capturing = False
         self._register_hotkey()
         if not name:
-            self.status_var.set("没有采集到按键")
+            self.status_var.set("按键采集超时，请重新点击设置")
             return
         if target == "hotkey":
             hotkey = normalize_key_name(name) or DEFAULT_HOTKEY
@@ -1758,10 +1815,34 @@ class AutoClicker:
         self.right_hotkey_handle = None
 
     def _on_hotkey(self):
+        now = time.time()
+        if now - self._last_hotkey_trigger < 0.2:
+            return
+        self._last_hotkey_trigger = now
         self.ui_queue.put(("toggle", None))
 
     def _on_right_hotkey(self):
+        now = time.time()
+        if now - self._last_hotkey_trigger < 0.2:
+            return
+        self._last_hotkey_trigger = now
         self.ui_queue.put(("right_toggle", None))
+
+    def _hotkey_poll_loop(self):
+        """轮询全局键盘状态，键盘库钩子失效时仍能启停。"""
+        while not self._hotkey_poll_stop.is_set():
+            if not self.capturing:
+                for target in ("hotkey", "right_hotkey"):
+                    name = getattr(self, target, "")
+                    pressed = key_is_pressed(name) if name and name != "right" else False
+                    previous = self._hotkey_poll_state.get(target, False)
+                    self._hotkey_poll_state[target] = pressed
+                    if pressed and not previous:
+                        if target == "hotkey":
+                            self._on_hotkey()
+                        else:
+                            self._on_right_hotkey()
+            time.sleep(0.02)
 
     # ── 主线程消息泵 ────────────────────────────────────────────────────────
     def _pump_queue(self):
@@ -2075,6 +2156,7 @@ class AutoClicker:
     def _on_close(self):
         try:
             self.running = False
+            self._hotkey_poll_stop.set()
             self._release_right()
             self._unregister_hotkey()
             if keyboard is not None:

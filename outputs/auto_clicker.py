@@ -25,6 +25,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 
 
 # ── 打包后 Tcl/Tk 运行库引导 ────────────────────────────────────────────────
@@ -166,7 +167,7 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v34"
+APP_VERSION = "v35"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -993,7 +994,10 @@ class AutoClicker:
         ttk.Checkbutton(count_options, text="达到目标自动停止（连续循环）",
                         variable=self.count_auto_next_var,
                         command=self._on_change).pack(side=tk.LEFT)
-        ttk.Label(count_options, text="召唤后等待").pack(side=tk.LEFT, padx=(10, 2))
+        ttk.Label(count_options, text="打开等待").pack(side=tk.LEFT, padx=(10, 2))
+        self.count_open_wait_var = tk.StringVar(value=f"{DEFAULT_COUNT_OPEN_WAIT:g}")
+        ttk.Entry(count_options, textvariable=self.count_open_wait_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(count_options, text="召唤后等待").pack(side=tk.LEFT, padx=3)
         self.count_post_click_wait_var = tk.StringVar(value=f"{DEFAULT_COUNT_POST_CLICK_WAIT:g}")
         ttk.Entry(count_options, textvariable=self.count_post_click_wait_var, width=6).pack(side=tk.LEFT)
         ttk.Label(count_options, text="秒；下一轮").pack(side=tk.LEFT, padx=3)
@@ -1117,6 +1121,7 @@ class AutoClicker:
         self.count_region_var.set(",".join(str(item) for item in self.count_ocr_region))
         self.count_ocr_regions = {key: list(value) for key, value in profile["count_ocr_regions"].items()}
         self.count_open_wait = profile["count_open_wait"]
+        self.count_open_wait_var.set(f"{self.count_open_wait:g}")
         self.count_post_click_wait = profile["count_post_click_wait"]
         self.count_next_cycle_wait = profile["count_next_cycle_wait"]
         self.count_auto_next = profile["count_auto_next"]
@@ -1723,6 +1728,15 @@ class AutoClicker:
 
     def _key_read_worker(self):
         name = None
+        try:
+            name = self._key_read_worker_loop()
+        finally:
+            # 无论采集成功、超时还是异常，都必须复位，保证热键轮询立即恢复
+            self.capturing = False
+            self.ui_queue.put(("key", name, getattr(self, "_key_target", None)))
+
+    def _key_read_worker_loop(self):
+        name = None
         deadline = time.time() + 15
         while self.capturing and time.time() < deadline:
             for vk in range(1, 256):
@@ -1735,7 +1749,7 @@ class AutoClicker:
             if name:
                 break
             time.sleep(0.02)
-        self.ui_queue.put(("key", name, getattr(self, "_key_target", None)))
+        return name
 
     def _handle_key_captured(self, name, target):
         self.capturing = False
@@ -1910,7 +1924,7 @@ class AutoClicker:
             if not self.capturing:
                 for target in ("hotkey", "right_hotkey"):
                     name = getattr(self, target, "")
-                    pressed = key_is_pressed(name) if name and name != "right" else False
+                    pressed = key_is_pressed(name) if name else False
                     previous = self._hotkey_poll_state.get(target, False)
                     self._hotkey_poll_state[target] = pressed
                     if pressed and not previous:
@@ -1921,12 +1935,27 @@ class AutoClicker:
             time.sleep(0.02)
 
     # ── 主线程消息泵 ────────────────────────────────────────────────────────
+    def _log_error(self, message):
+        """把异常写入 debug.log 并显示在状态栏，保证冻结 exe 里错误可见。"""
+        try:
+            with open(os.path.join(APP_DIR, "debug.log"), "a", encoding="utf-8") as fh:
+                fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
+                fh.write(traceback.format_exc() + "\n")
+        except Exception:
+            pass
+        try:
+            self.status_var.set("出错：%s（详见 debug.log）" % message)
+        except Exception:
+            pass
+
     def _pump_queue(self):
         try:
             while True:
                 self._handle_message(self.ui_queue.get_nowait())
         except queue.Empty:
             pass
+        except Exception:
+            self._log_error("界面消息处理出错")
         self.root.after(60, self._pump_queue)
 
     def _handle_message(self, message):
@@ -1975,6 +2004,12 @@ class AutoClicker:
     def _start_clicking(self):
         if self.running:
             return
+        try:
+            self._start_clicking_impl()
+        except Exception:
+            self._log_error("启动失败")
+
+    def _start_clicking_impl(self):
         self._sync_count_values()
         if self.execution_mode_var.get() == "Boss 卡计数":
             if not ocr_available():
@@ -2017,6 +2052,12 @@ class AutoClicker:
     def _stop_clicking(self):
         if not self.running:
             return
+        try:
+            self._stop_clicking_impl()
+        except Exception:
+            self._log_error("停止失败")
+
+    def _stop_clicking_impl(self):
         self.running = False
         self.btn_start.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.DISABLED)
@@ -2063,8 +2104,11 @@ class AutoClicker:
             "y": int(self._safe_float(self.count_summon_y_var.get(), 0)),
         }
         self.count_ocr_region = list(self._current_count_region())
-        self.count_open_wait = max(
-            1.5, min(MAX_INTERVAL, self._safe_float(self.count_open_wait_var.get(), DEFAULT_COUNT_OPEN_WAIT)))
+        open_wait_var = getattr(self, "count_open_wait_var", None)
+        open_wait_value = getattr(self, "count_open_wait", DEFAULT_COUNT_OPEN_WAIT)
+        if open_wait_var is not None:
+            open_wait_value = self._safe_float(open_wait_var.get(), DEFAULT_COUNT_OPEN_WAIT)
+        self.count_open_wait = max(1.5, min(MAX_INTERVAL, open_wait_value))
         self.count_post_click_wait = max(
             MIN_INTERVAL, min(MAX_INTERVAL, self._safe_float(self.count_post_click_wait_var.get(), DEFAULT_COUNT_POST_CLICK_WAIT)))
         self.count_next_cycle_wait = max(

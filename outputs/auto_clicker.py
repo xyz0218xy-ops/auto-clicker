@@ -166,7 +166,7 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v32"
+APP_VERSION = "v33"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -199,6 +199,8 @@ INPUT_MOUSE = 0
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_WHEEL = 0x0800
+WM_HOTKEY = 0x0312
+PM_REMOVE = 0x0001
 
 # --- Raw Input (兼容游戏的鼠标输入捕获) ---
 
@@ -224,6 +226,17 @@ class INPUT(ctypes.Structure):
 SendInput = user32.SendInput
 SendInput.argtypes = [ctypes.wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
 SendInput.restype = ctypes.wintypes.UINT
+
+
+class MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.wintypes.HWND),
+        ("message", ctypes.wintypes.UINT),
+        ("wParam", ctypes.wintypes.WPARAM),
+        ("lParam", ctypes.wintypes.LPARAM),
+        ("time", ctypes.wintypes.DWORD),
+        ("pt", ctypes.wintypes.POINT),
+    ]
 
 def _pixel_to_abs(x, y):
     """将像素坐标转换为 SendInput 绝对坐标 (0-65535)。"""
@@ -789,6 +802,8 @@ class AutoClicker:
         self._hotkey_poll_stop = threading.Event()
         self._hotkey_poll_state = {"hotkey": False, "right_hotkey": False}
         self._last_hotkey_trigger = 0.0
+        self._win_hotkey_stop = threading.Event()
+        self._win_hotkey_thread = None
 
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
@@ -1785,6 +1800,7 @@ class AutoClicker:
     # ── 全局热键 ────────────────────────────────────────────────────────────
     def _register_hotkey(self):
         self._unregister_hotkey()
+        self._restart_win_hotkey_worker()
         if not HAS_KEYBOARD:
             return
         if self.hotkey:
@@ -1813,6 +1829,50 @@ class AutoClicker:
                         pass
         self.hotkey_handle = None
         self.right_hotkey_handle = None
+
+    def _restart_win_hotkey_worker(self):
+        """重启系统级 RegisterHotKey 后备线程，保证修改热键后立即生效。"""
+        self._win_hotkey_stop.set()
+        worker = self._win_hotkey_thread
+        if worker and worker.is_alive():
+            worker.join(timeout=0.3)
+        self._win_hotkey_stop = threading.Event()
+        self._win_hotkey_thread = threading.Thread(target=self._win_hotkey_worker, daemon=True)
+        self._win_hotkey_thread.start()
+
+    def _win_hotkey_worker(self):
+        """使用 Windows RegisterHotKey 提供最后一层全局热键后备。"""
+        create = user32.CreateWindowExW
+        create.argtypes = [
+            ctypes.wintypes.DWORD, ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR,
+            ctypes.wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.wintypes.HWND, ctypes.wintypes.HMENU, ctypes.wintypes.HINSTANCE,
+            ctypes.c_void_p,
+        ]
+        create.restype = ctypes.wintypes.HWND
+        hwnd = create(0, "STATIC", "AutoClickerHotkeys", 0, 0, 0, 0, 0, 0, 0, 0, None)
+        if not hwnd:
+            return
+        registered = {}
+        try:
+            for identifier, target in ((1001, "hotkey"), (1002, "right_hotkey")):
+                vk = key_name_to_vk(getattr(self, target, ""))
+                if vk and user32.RegisterHotKey(hwnd, identifier, 0, vk):
+                    registered[identifier] = target
+            message = MSG()
+            while not self._win_hotkey_stop.is_set():
+                if user32.PeekMessageW(ctypes.byref(message), hwnd, WM_HOTKEY, WM_HOTKEY, PM_REMOVE):
+                    target = registered.get(int(message.wParam))
+                    if target == "hotkey":
+                        self._on_hotkey()
+                    elif target == "right_hotkey":
+                        self._on_right_hotkey()
+                else:
+                    time.sleep(0.02)
+        finally:
+            for identifier in registered:
+                user32.UnregisterHotKey(hwnd, identifier)
+            user32.DestroyWindow(hwnd)
 
     def _on_hotkey(self):
         now = time.time()
@@ -2157,6 +2217,7 @@ class AutoClicker:
         try:
             self.running = False
             self._hotkey_poll_stop.set()
+            self._win_hotkey_stop.set()
             self._release_right()
             self._unregister_hotkey()
             if keyboard is not None:

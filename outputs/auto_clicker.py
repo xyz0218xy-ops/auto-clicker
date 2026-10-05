@@ -166,7 +166,7 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v33"
+APP_VERSION = "v34"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -639,7 +639,10 @@ def key_is_pressed(name):
     vk = key_name_to_vk(name)
     if not vk:
         return False
-    return bool(user32.GetAsyncKeyState(vk) & 0x8000)
+    get_state = user32.GetAsyncKeyState
+    get_state.argtypes = [ctypes.c_int]
+    get_state.restype = ctypes.c_short
+    return bool(get_state(vk) & 0x8000)
 
 
 def normalize_key_name(value):
@@ -1853,15 +1856,28 @@ class AutoClicker:
         hwnd = create(0, "STATIC", "AutoClickerHotkeys", 0, 0, 0, 0, 0, 0, 0, 0, None)
         if not hwnd:
             return
+        peek = user32.PeekMessageW
+        peek.argtypes = [ctypes.POINTER(MSG), ctypes.wintypes.HWND, ctypes.wintypes.UINT,
+                         ctypes.wintypes.UINT, ctypes.wintypes.UINT]
+        peek.restype = ctypes.wintypes.BOOL
+        register = user32.RegisterHotKey
+        register.argtypes = [ctypes.wintypes.HWND, ctypes.c_int, ctypes.wintypes.UINT, ctypes.wintypes.UINT]
+        register.restype = ctypes.wintypes.BOOL
+        unregister = user32.UnregisterHotKey
+        unregister.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+        unregister.restype = ctypes.wintypes.BOOL
+        destroy = user32.DestroyWindow
+        destroy.argtypes = [ctypes.wintypes.HWND]
+        destroy.restype = ctypes.wintypes.BOOL
         registered = {}
         try:
             for identifier, target in ((1001, "hotkey"), (1002, "right_hotkey")):
                 vk = key_name_to_vk(getattr(self, target, ""))
-                if vk and user32.RegisterHotKey(hwnd, identifier, 0, vk):
+                if vk and register(hwnd, identifier, 0, vk):
                     registered[identifier] = target
             message = MSG()
             while not self._win_hotkey_stop.is_set():
-                if user32.PeekMessageW(ctypes.byref(message), hwnd, WM_HOTKEY, WM_HOTKEY, PM_REMOVE):
+                if peek(ctypes.byref(message), hwnd, WM_HOTKEY, WM_HOTKEY, PM_REMOVE):
                     target = registered.get(int(message.wParam))
                     if target == "hotkey":
                         self._on_hotkey()
@@ -1871,8 +1887,8 @@ class AutoClicker:
                     time.sleep(0.02)
         finally:
             for identifier in registered:
-                user32.UnregisterHotKey(hwnd, identifier)
-            user32.DestroyWindow(hwnd)
+                unregister(hwnd, identifier)
+            destroy(hwnd)
 
     def _on_hotkey(self):
         now = time.time()

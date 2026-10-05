@@ -25,7 +25,7 @@ except Exception:
 
 
 DEFAULT_REGION = (0, 0, 120, 36)
-MAX_COUNT_DIGITS = 9
+MAX_COUNT_DIGITS = 6
 
 
 class CountSafetyError(RuntimeError):
@@ -105,19 +105,24 @@ def capture_region(region):
         return None
 
 
-def preprocess_for_digits(image):
-    """灰度、增强对比度并放大，减少数字识别抖动。"""
+def _preprocess_variants(image):
+    """生成多种预处理结果，适应游戏界面中不同的数字字体和背景。"""
     if not HAS_PIL or image is None:
-        return None
+        return []
     try:
         gray = ImageOps.grayscale(image)
-        gray = ImageOps.autocontrast(gray)
-        gray = gray.filter(ImageFilter.SHARPEN)
+        gray = ImageOps.autocontrast(gray).filter(ImageFilter.SHARPEN)
         width, height = gray.size
-        scale = max(2, min(4, int(900 / max(1, width))))
-        return gray.resize((width * scale, height * scale))
+        scale = max(3, min(6, int(900 / max(1, width))))
+        enlarged = gray.resize((width * scale, height * scale))
+        return [
+            enlarged,
+            enlarged.point(lambda value: 255 if value >= 145 else 0),
+            ImageOps.invert(enlarged.point(lambda value: 255 if value >= 145 else 0)),
+            ImageOps.equalize(gray).resize((width * scale, height * scale)),
+        ]
     except Exception:
-        return None
+        return []
 
 
 def clean_digits(text):
@@ -138,14 +143,22 @@ def read_count_once(region, command=None, tessdata_dir=None):
         return None
     try:
         pytesseract.pytesseract.tesseract_cmd = command
-        image = preprocess_for_digits(capture_region(region))
-        if image is None:
+        variants = _preprocess_variants(capture_region(region))
+        if not variants:
             return None
-        config_parts = ["--psm", "7", "-c", "tessedit_char_whitelist=0123456789"]
         if tessdata_dir:
             os.environ["TESSDATA_PREFIX"] = os.path.abspath(tessdata_dir)
-        text = pytesseract.image_to_string(image, config=" ".join(config_parts))
-        return clean_digits(text)
+        votes = {}
+        for image in variants:
+            for psm in ("7", "8", "13"):
+                config = f"--psm {psm} -c tessedit_char_whitelist=0123456789"
+                text = pytesseract.image_to_string(image, config=config)
+                value = clean_digits(text)
+                if value is not None:
+                    votes[value] = votes.get(value, 0) + 1
+        if not votes:
+            return None
+        return max(votes.items(), key=lambda item: (item[1], item[0]))[0]
     except Exception:
         return None
 

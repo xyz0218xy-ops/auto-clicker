@@ -166,7 +166,7 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v29"
+APP_VERSION = "v30"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -1954,7 +1954,15 @@ class AutoClicker:
             self._sleep_interruptible(random.uniform(0.12, 0.24))
             mouse_click_left(int(summon["x"]), int(summon["y"]), jitter=False)
             self._sleep_interruptible(self.count_post_click_wait)
-            after, stable_count, _raw = read_count_stable(region, command=command, tessdata_dir=tessdata_dir)
+            after = None
+            stable_count = 0
+            for _attempt in range(4):
+                self._set_status("正在确认召唤后的数量变化……")
+                after, stable_count, _raw = read_count_stable(
+                    region, samples=5, delay=0.12, command=command, tessdata_dir=tessdata_dir)
+                if after is not None and after < before:
+                    break
+                self._sleep_interruptible(0.5)
             if after is None:
                 raise CountSafetyError(f"召唤后 OCR 不稳定（连续稳定读取 {stable_count} 次）")
             progress = guard.confirm(before, after)

@@ -166,7 +166,7 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v30"
+APP_VERSION = "v31"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -180,11 +180,12 @@ DEFAULT_JITTER_MAX = 2.0  # 随机倍率上限
 DEFAULT_COUNT_TARGET = 10
 DEFAULT_COUNT_STAR = 1
 DEFAULT_COUNT_OPEN_KEY = "e"
-DEFAULT_COUNT_OPEN_WAIT = 1.0
+DEFAULT_COUNT_OPEN_WAIT = 2.0
 DEFAULT_COUNT_POST_CLICK_WAIT = 2.0
 DEFAULT_COUNT_NEXT_CYCLE_WAIT = 5.0
 DEFAULT_COUNT_AUTO_NEXT = True
 DEFAULT_COUNT_REGION = (0, 0, 120, 36)
+DEFAULT_COUNT_BOSS_CARD_POINT = (0, 0)
 
 user32 = ctypes.windll.user32
 
@@ -429,6 +430,11 @@ def normalize_profile(raw):
     raw_star_points = raw.get("count_star_points") if isinstance(raw.get("count_star_points"), dict) else {}
     for star in range(1, 6):
         star_points[str(star)] = dict(zip(("x", "y"), normalize_point(raw_star_points.get(str(star)))))
+    selected_star = max(1, min(5, int(safe_seconds(raw.get("count_star", DEFAULT_COUNT_STAR), DEFAULT_COUNT_STAR, 1, 5))))
+    boss_card_point = normalize_point(raw.get("count_boss_card_point"))
+    if not any(boss_card_point):
+        boss_card_point = normalize_point(raw_star_points.get(str(selected_star)))
+    raw_ocr_regions = raw.get("count_ocr_regions") if isinstance(raw.get("count_ocr_regions"), dict) else {}
     execution_mode = "count" if str(raw.get("execution_mode", "") or "").lower() in ("count", "boss_count") else "free"
     profile = {
         "hotkey": normalize_key_name(raw.get("hotkey") or raw.get("hotkey_vk")) or DEFAULT_HOTKEY,
@@ -445,9 +451,11 @@ def normalize_profile(raw):
         "count_target": max(1, min(999999, int(safe_seconds(raw.get("count_target", DEFAULT_COUNT_TARGET), DEFAULT_COUNT_TARGET, 1, 999999)))),
         "count_star": max(1, min(5, int(safe_seconds(raw.get("count_star", DEFAULT_COUNT_STAR), DEFAULT_COUNT_STAR, 1, 5)))),
         "count_open_key": normalize_key_name(raw.get("count_open_key")) or DEFAULT_COUNT_OPEN_KEY,
+        "count_boss_card_point": dict(zip(("x", "y"), boss_card_point)),
         "count_summon_point": dict(zip(("x", "y"), normalize_point(raw.get("count_summon_point")))),
         "count_star_points": star_points,
-        "count_ocr_regions": normalize_region_map(raw.get("count_ocr_regions")),
+        "count_ocr_region": list(parse_region(raw.get("count_ocr_region"), parse_region(raw_ocr_regions.get(str(selected_star), DEFAULT_COUNT_REGION), DEFAULT_COUNT_REGION))),
+        "count_ocr_regions": normalize_region_map(raw_ocr_regions),
         "count_open_wait": safe_seconds(raw.get("count_open_wait"), DEFAULT_COUNT_OPEN_WAIT, 0.05, MAX_INTERVAL),
         "count_post_click_wait": safe_seconds(raw.get("count_post_click_wait"), DEFAULT_COUNT_POST_CLICK_WAIT, 0.05, MAX_INTERVAL),
         "count_next_cycle_wait": safe_seconds(raw.get("count_next_cycle_wait"), DEFAULT_COUNT_NEXT_CYCLE_WAIT, 0.05, MAX_INTERVAL),
@@ -709,8 +717,10 @@ class AutoClicker:
         self.count_target = DEFAULT_COUNT_TARGET
         self.count_star = DEFAULT_COUNT_STAR
         self.count_open_key = DEFAULT_COUNT_OPEN_KEY
+        self.count_boss_card_point = dict(zip(("x", "y"), DEFAULT_COUNT_BOSS_CARD_POINT))
         self.count_summon_point = {"x": 0, "y": 0}
         self.count_star_points = {str(star): {"x": 0, "y": 0} for star in range(1, 6)}
+        self.count_ocr_region = list(DEFAULT_COUNT_REGION)
         self.count_ocr_regions = {str(star): list(DEFAULT_COUNT_REGION) for star in range(1, 6)}
         self.count_open_wait = DEFAULT_COUNT_OPEN_WAIT
         self.count_post_click_wait = DEFAULT_COUNT_POST_CLICK_WAIT
@@ -866,13 +876,6 @@ class AutoClicker:
         ttk.Label(count_top, text="目标次数").pack(side=tk.LEFT, padx=(10, 2))
         self.count_target_var = tk.StringVar(value=str(DEFAULT_COUNT_TARGET))
         ttk.Entry(count_top, textvariable=self.count_target_var, width=7).pack(side=tk.LEFT)
-        ttk.Label(count_top, text="星级").pack(side=tk.LEFT, padx=(10, 2))
-        self.count_star_var = tk.StringVar(value=str(DEFAULT_COUNT_STAR))
-        self.count_star_box = ttk.Combobox(
-            count_top, textvariable=self.count_star_var, state="readonly",
-            values=("1", "2", "3", "4", "5"), width=4)
-        self.count_star_box.pack(side=tk.LEFT)
-        self.count_star_box.bind("<<ComboboxSelected>>", self._on_count_star_change)
         ttk.Label(count_top, text="唤出键").pack(side=tk.LEFT, padx=(10, 2))
         self.count_open_key_var = tk.StringVar(value=key_display(DEFAULT_COUNT_OPEN_KEY))
         self.count_open_key_holder = {"name": DEFAULT_COUNT_OPEN_KEY}
@@ -892,13 +895,13 @@ class AutoClicker:
         ttk.Entry(count_points, textvariable=self.count_summon_y_var, width=8).pack(side=tk.LEFT)
         ttk.Button(count_points, text="采集召唤按钮", width=12,
                    command=self._capture_count_summon).pack(side=tk.LEFT, padx=5)
-        ttk.Label(count_points, text="当前星级坐标 X/Y").pack(side=tk.LEFT, padx=(10, 2))
-        self.count_star_x_var = tk.StringVar(value="0")
-        self.count_star_y_var = tk.StringVar(value="0")
-        ttk.Entry(count_points, textvariable=self.count_star_x_var, width=8).pack(side=tk.LEFT, padx=3)
-        ttk.Entry(count_points, textvariable=self.count_star_y_var, width=8).pack(side=tk.LEFT)
-        ttk.Button(count_points, text="采集当前星级", width=12,
-                   command=self._capture_count_star).pack(side=tk.LEFT, padx=5)
+        ttk.Label(count_points, text="Boss 卡坐标 X/Y").pack(side=tk.LEFT, padx=(10, 2))
+        self.count_boss_card_x_var = tk.StringVar(value="0")
+        self.count_boss_card_y_var = tk.StringVar(value="0")
+        ttk.Entry(count_points, textvariable=self.count_boss_card_x_var, width=8).pack(side=tk.LEFT, padx=3)
+        ttk.Entry(count_points, textvariable=self.count_boss_card_y_var, width=8).pack(side=tk.LEFT)
+        ttk.Button(count_points, text="采集 Boss 卡", width=12,
+                   command=self._capture_count_boss_card).pack(side=tk.LEFT, padx=5)
 
         count_ocr = ttk.Frame(count_frame)
         count_ocr.pack(fill=tk.X, padx=8, pady=2)
@@ -978,10 +981,6 @@ class AutoClicker:
             count_target = int(float(self.count_target_var.get()))
         except (TypeError, ValueError):
             count_target = DEFAULT_COUNT_TARGET
-        try:
-            count_star = int(float(self.count_star_var.get()))
-        except (TypeError, ValueError):
-            count_star = DEFAULT_COUNT_STAR
         count_open_key = self.count_open_key_holder.get("name") or DEFAULT_COUNT_OPEN_KEY
         return {
             "hotkey": self.hotkey,
@@ -994,13 +993,17 @@ class AutoClicker:
             "jitter_max": self._safe_float(self.jitter_max_var.get(), DEFAULT_JITTER_MAX),
             "execution_mode": execution_mode,
             "count_target": max(1, min(999999, count_target)),
-            "count_star": max(1, min(5, count_star)),
             "count_open_key": count_open_key,
+            "count_boss_card_point": {
+                "x": int(self._safe_float(self.count_boss_card_x_var.get(), 0)),
+                "y": int(self._safe_float(self.count_boss_card_y_var.get(), 0)),
+            },
             "count_summon_point": {
                 "x": int(self._safe_float(self.count_summon_x_var.get(), 0)),
                 "y": int(self._safe_float(self.count_summon_y_var.get(), 0)),
             },
             "count_star_points": {key: dict(value) for key, value in self.count_star_points.items()},
+            "count_ocr_region": list(self._current_count_region()),
             "count_ocr_regions": {key: list(value) for key, value in self.count_ocr_regions.items()},
             "count_open_wait": self.count_open_wait,
             "count_post_click_wait": self._safe_float(self.count_post_click_wait_var.get(), DEFAULT_COUNT_POST_CLICK_WAIT),
@@ -1028,16 +1031,19 @@ class AutoClicker:
         self.jitter_max_var.set(f"{profile['jitter_max']:g}")
         self.execution_mode_var.set("Boss 卡计数" if profile["execution_mode"] == "count" else "自由循环")
         self.count_target = profile["count_target"]
-        self.count_star = profile["count_star"]
         self.count_target_var.set(str(self.count_target))
-        self.count_star_var.set(str(self.count_star))
         self.count_open_key = profile["count_open_key"]
         self.count_open_key_holder["name"] = self.count_open_key
         self.count_open_key_var.set(key_display(self.count_open_key))
+        self.count_boss_card_point = dict(profile["count_boss_card_point"])
+        self.count_boss_card_x_var.set(str(self.count_boss_card_point["x"]))
+        self.count_boss_card_y_var.set(str(self.count_boss_card_point["y"]))
         self.count_summon_point = dict(profile["count_summon_point"])
         self.count_summon_x_var.set(str(self.count_summon_point["x"]))
         self.count_summon_y_var.set(str(self.count_summon_point["y"]))
         self.count_star_points = {key: dict(value) for key, value in profile["count_star_points"].items()}
+        self.count_ocr_region = list(profile["count_ocr_region"])
+        self.count_region_var.set(",".join(str(item) for item in self.count_ocr_region))
         self.count_ocr_regions = {key: list(value) for key, value in profile["count_ocr_regions"].items()}
         self.count_open_wait = profile["count_open_wait"]
         self.count_post_click_wait = profile["count_post_click_wait"]
@@ -1049,7 +1055,6 @@ class AutoClicker:
         self.count_auto_next_var.set(self.count_auto_next)
         self.count_progress_var.set(f"进度 {self.count_progress} / {self.count_target}")
         self.count_ocr_status_var.set("OCR：未测试")
-        self._on_count_star_change()
         self.profile_var.set(name)
         self._sync_jitter()
         self._refresh_profile_list()
@@ -1515,55 +1520,31 @@ class AutoClicker:
 
         self._countdown_window("请把鼠标移到 Boss 召唤按钮中心，倒计时结束后自动记录", done)
 
-    def _capture_count_star(self):
-        try:
-            star = str(max(1, min(5, int(float(self.count_star_var.get())))))
-        except (TypeError, ValueError):
-            star = "1"
-
+    def _capture_count_boss_card(self):
         def done(x_value, y_value):
-            self.count_star_x_var.set(str(x_value))
-            self.count_star_y_var.set(str(y_value))
-            self.count_star_points[star] = {"x": int(x_value), "y": int(y_value)}
+            self.count_boss_card_x_var.set(str(x_value))
+            self.count_boss_card_y_var.set(str(y_value))
+            self.count_boss_card_point = {"x": int(x_value), "y": int(y_value)}
             self._on_change()
-            self.status_var.set(f"已采集 {star} 星级坐标 ({x_value}, {y_value})")
+            self.status_var.set(f"已采集 Boss 卡坐标 ({x_value}, {y_value})")
 
-        self._countdown_window(f"请把鼠标移到 {star} 星级卡片位置，倒计时结束后自动记录", done)
+        self._countdown_window("请把鼠标移到 Boss 卡位置，倒计时结束后自动记录", done)
 
     def _capture_count_region(self):
         def done(x_value, y_value):
             width, height = 120, 36
             region = [max(0, int(x_value - width // 2)), max(0, int(y_value - height // 2)), width, height]
             self.count_region_var.set(",".join(str(item) for item in region))
-            try:
-                star = str(max(1, min(5, int(float(self.count_star_var.get())))))
-            except (TypeError, ValueError):
-                star = "1"
-            self.count_ocr_regions[star] = region
+            self.count_ocr_region = region
             self._on_change()
-            self.status_var.set(f"已采集 {star} 星级数量区域 {','.join(str(item) for item in region)}")
+            self.status_var.set(f"已采集 Boss 卡数量区域 {','.join(str(item) for item in region)}")
 
         self._countdown_window("请把鼠标移到 Boss 卡数量数字右下角，倒计时结束后自动记录", done)
 
     def _current_count_region(self):
-        try:
-            star = str(max(1, min(5, int(float(self.count_star_var.get())))))
-        except (TypeError, ValueError):
-            star = "1"
-        region = parse_region(self.count_region_var.get(), self.count_ocr_regions.get(star, DEFAULT_COUNT_REGION))
-        self.count_ocr_regions[star] = list(region)
+        region = parse_region(self.count_region_var.get(), self.count_ocr_region)
+        self.count_ocr_region = list(region)
         return region
-
-    def _on_count_star_change(self, _event=None):
-        try:
-            star = str(max(1, min(5, int(float(self.count_star_var.get())))))
-        except (TypeError, ValueError):
-            star = "1"
-        point = self.count_star_points.get(star, {"x": 0, "y": 0})
-        self.count_star_x_var.set(str(point.get("x", 0)))
-        self.count_star_y_var.set(str(point.get("y", 0)))
-        region = self.count_ocr_regions.get(star, list(DEFAULT_COUNT_REGION))
-        self.count_region_var.set(",".join(str(item) for item in region))
 
     def _test_count_ocr(self):
         region = self._current_count_region()
@@ -1850,13 +1831,13 @@ class AutoClicker:
                 messagebox.showwarning(APP_NAME, "Boss 卡计数模式需要 keyboard 库来按唤出键。", parent=self.root)
                 return
             summon = self.count_summon_point
-            star_point = self.count_star_points.get(str(self.count_star), {"x": 0, "y": 0})
-            region = parse_region(self.count_ocr_regions.get(str(self.count_star), DEFAULT_COUNT_REGION), DEFAULT_COUNT_REGION)
+            boss_card = self.count_boss_card_point
+            region = parse_region(self.count_ocr_region, DEFAULT_COUNT_REGION)
             if summon.get("x", 0) == 0 and summon.get("y", 0) == 0:
                 messagebox.showwarning(APP_NAME, "请先采集召唤按钮坐标。", parent=self.root)
                 return
-            if star_point.get("x", 0) == 0 and star_point.get("y", 0) == 0:
-                messagebox.showwarning(APP_NAME, f"请先采集 {self.count_star} 星级卡片坐标。", parent=self.root)
+            if boss_card.get("x", 0) == 0 and boss_card.get("y", 0) == 0:
+                messagebox.showwarning(APP_NAME, "请先采集 Boss 卡坐标。", parent=self.root)
                 return
             if region[2] < 20 or region[3] < 8:
                 messagebox.showwarning(APP_NAME, "OCR 数量区域至少需要 20x8 像素，请重新采集。", parent=self.root)
@@ -1915,16 +1896,18 @@ class AutoClicker:
         except (TypeError, ValueError):
             self.count_target = DEFAULT_COUNT_TARGET
             self.count_target_var.set(str(self.count_target))
-        try:
-            self.count_star = max(1, min(5, int(float(self.count_star_var.get()))))
-        except (TypeError, ValueError):
-            self.count_star = DEFAULT_COUNT_STAR
-            self.count_star_var.set(str(self.count_star))
         self.count_open_key = self.count_open_key_holder.get("name") or DEFAULT_COUNT_OPEN_KEY
+        self.count_boss_card_point = {
+            "x": int(self._safe_float(self.count_boss_card_x_var.get(), 0)),
+            "y": int(self._safe_float(self.count_boss_card_y_var.get(), 0)),
+        }
         self.count_summon_point = {
             "x": int(self._safe_float(self.count_summon_x_var.get(), 0)),
             "y": int(self._safe_float(self.count_summon_y_var.get(), 0)),
         }
+        self.count_ocr_region = list(self._current_count_region())
+        self.count_open_wait = max(
+            1.5, min(MAX_INTERVAL, self._safe_float(self.count_open_wait_var.get(), DEFAULT_COUNT_OPEN_WAIT)))
         self.count_post_click_wait = max(
             MIN_INTERVAL, min(MAX_INTERVAL, self._safe_float(self.count_post_click_wait_var.get(), DEFAULT_COUNT_POST_CLICK_WAIT)))
         self.count_next_cycle_wait = max(
@@ -1934,23 +1917,30 @@ class AutoClicker:
 
     def _run_count_mode(self):
         """安全计数状态机：稳定 OCR → 点击 → 等待变化 → 确认一次消耗。"""
-        star = self.count_star
         summon = self.count_summon_point
-        star_point = self.count_star_points.get(str(star), {"x": 0, "y": 0})
-        region = parse_region(self.count_ocr_regions.get(str(star), DEFAULT_COUNT_REGION), DEFAULT_COUNT_REGION)
+        boss_card = self.count_boss_card_point
+        region = parse_region(self.count_ocr_region, DEFAULT_COUNT_REGION)
         guard = CountGuard(self.count_target, self.count_progress)
         command = resolve_tesseract()
         tessdata_dir = resolve_tessdata(command)
         while self.running and not guard.reached:
-            self._set_status(f"计数模式：等待 {star} 星级召唤界面（进度 {guard.progress}/{guard.target}）")
+            self._set_status(f"计数模式：等待召唤界面（进度 {guard.progress}/{guard.target}）")
             if not key_tap(self.count_open_key):
                 raise CountSafetyError(f"唤出键 {key_display(self.count_open_key)} 执行失败")
-            self._sleep_interruptible(self.count_open_wait)
-            before, stable_count, _raw = read_count_stable(region, command=command, tessdata_dir=tessdata_dir)
+            self._set_status(f"已唤出召唤界面，正在读取 Boss 卡数量……")
+            before = None
+            stable_count = 0
+            for attempt in range(4):
+                self._sleep_interruptible(self.count_open_wait if attempt == 0 else 0.5)
+                before, stable_count, _raw = read_count_stable(
+                    region, samples=5, delay=0.12, command=command, tessdata_dir=tessdata_dir)
+                if before is not None:
+                    break
+                self._set_status(f"召唤界面数量区域尚未稳定，正在重试（{attempt + 1}/4）")
             if before is None:
-                raise CountSafetyError(f"召唤界面 OCR 不稳定（连续稳定读取 {stable_count} 次）")
+                raise CountSafetyError(f"召唤界面数量区域无法识别（连续稳定读取 {stable_count} 次）")
             self._set_status(f"OCR 识别到当前数量：{before}")
-            mouse_click_left(int(star_point["x"]), int(star_point["y"]), jitter=False)
+            mouse_click_left(int(boss_card["x"]), int(boss_card["y"]), jitter=False)
             self._sleep_interruptible(random.uniform(0.12, 0.24))
             mouse_click_left(int(summon["x"]), int(summon["y"]), jitter=False)
             self._sleep_interruptible(self.count_post_click_wait)

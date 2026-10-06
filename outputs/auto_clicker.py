@@ -174,7 +174,7 @@ except Exception:  # 缺少 keyboard 库时只保留鼠标功能
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v36"
+APP_VERSION = "v37"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -190,7 +190,7 @@ DEFAULT_COUNT_STAR = 1
 DEFAULT_COUNT_OPEN_KEY = "e"
 DEFAULT_COUNT_OPEN_WAIT = 2.0
 DEFAULT_COUNT_POST_CLICK_WAIT = 2.0
-DEFAULT_COUNT_NEXT_CYCLE_WAIT = 5.0
+DEFAULT_COUNT_NEXT_CYCLE_WAIT = 1.2
 DEFAULT_COUNT_AUTO_NEXT = True
 DEFAULT_COUNT_REGION = (0, 0, 120, 36)
 DEFAULT_COUNT_BOSS_CARD_POINT = (0, 0)
@@ -1012,7 +1012,7 @@ class AutoClicker:
         ttk.Label(count_options, text="召唤后等待").pack(side=tk.LEFT, padx=3)
         self.count_post_click_wait_var = tk.StringVar(value=f"{DEFAULT_COUNT_POST_CLICK_WAIT:g}")
         ttk.Entry(count_options, textvariable=self.count_post_click_wait_var, width=6).pack(side=tk.LEFT)
-        ttk.Label(count_options, text="秒；下一轮").pack(side=tk.LEFT, padx=3)
+        ttk.Label(count_options, text="秒；轮询间隔").pack(side=tk.LEFT, padx=3)
         self.count_next_cycle_wait_var = tk.StringVar(value=f"{DEFAULT_COUNT_NEXT_CYCLE_WAIT:g}")
         ttk.Entry(count_options, textvariable=self.count_next_cycle_wait_var, width=6).pack(side=tk.LEFT)
         ttk.Label(count_options, text="秒").pack(side=tk.LEFT, padx=2)
@@ -2197,8 +2197,36 @@ class AutoClicker:
         bottom = min(screen_height, y + height + pad)
         return (left, top, right - left, bottom - top)
 
+    def _wait_summon_interface(self, region, command, tessdata_dir):
+        """轮询等待召唤界面出现：先 OCR 检测（界面已开就不按键，避免按 E 反而关闭），
+        未检测到才按唤出键试探。Boss 存活期间界面打不开，按 E 无效；
+        Boss 被击杀后下一次试探即可打开界面，快速衔接下一轮。返回识别到的数量。"""
+        presses = 0
+        while self.running:
+            value, _used, _raw = read_count_quick(
+                region, attempts=1, command=command, tessdata_dir=tessdata_dir)
+            if value is not None and value > 0:
+                return value
+            presses += 1
+            self._set_status(
+                f"召唤界面未出现（已试探 {presses} 次），按下 {key_display(self.count_open_key)} "
+                f"唤出；Boss 存活期间会自动持续等待，击杀后立即衔接……")
+            if not key_tap(self.count_open_key):
+                self._log_debug("唤出键执行失败（keyboard 不可用），继续轮询")
+            if presses % 10 == 0:
+                self._log_debug(
+                    "召唤界面长时间未检测到：请确认数量区域坐标正确，或先点「学习数字」")
+            if presses == 1:
+                open_wait = min(3.0, max(0.3, self.count_open_wait))
+                self._sleep_interruptible(open_wait)
+            else:
+                poll_base = min(2.0, max(0.4, self.count_next_cycle_wait))
+                self._sleep_interruptible(random.uniform(poll_base * 0.6, poll_base * 1.3))
+        return None
+
     def _run_count_mode(self):
-        """计数状态机：快速三层识别 → 点击 → 约 2 秒快速核对，读不到按消耗 1 张继续。"""
+        """计数状态机：界面轮询 → 三层识别 → 拟人点击召唤 → 快速核对 →
+        击杀 Boss 后自动衔接下一轮，持续到目标次数或停止。"""
         summon = self.count_summon_point
         boss_card = self.count_boss_card_point
         region = self._expand_region_to_screen(self.count_ocr_region)
@@ -2213,30 +2241,18 @@ class AutoClicker:
 
         verify_timeout = max(1.0, min(2.0, self.count_post_click_wait))
         while self.running and not guard.reached:
-            self._set_status(
-                f"计数模式：按下 {key_display(self.count_open_key)} 唤出召唤界面"
-                f"（进度 {guard.progress}/{guard.target}）")
-            if not key_tap(self.count_open_key):
-                raise CountSafetyError(f"唤出键 {key_display(self.count_open_key)} 执行失败")
-            self._sleep_interruptible(self.count_open_wait)
-
-            # 读前数量：单次三层读取（约 100ms 内），失败最多快速重试 3 次
-            before = None
-            self._set_status("已唤出召唤界面，正在读取 Boss 卡数量……")
-            for attempt in range(3):
-                before, _used, _raw = read_count_quick(
-                    region, attempts=1, command=command, tessdata_dir=tessdata_dir)
-                if before is not None:
-                    break
-                self._set_status(f"数量区域读取失败，正在重试（{attempt + 1}/3）")
-                self._sleep_interruptible(0.2)
-            if before is None:
-                raise CountSafetyError("召唤界面数量区域无法识别，已停止（请检查数量区域，或先点「学习数字」）")
+            # 等待召唤界面出现（击杀 Boss 后自动衔接的关键）
+            self._set_status(f"计数模式：等待召唤界面（进度 {guard.progress}/{guard.target}）")
+            before = self._wait_summon_interface(region, command, tessdata_dir)
+            if not self.running:
+                break
             self._set_status(f"识别到当前数量：{before}")
 
-            mouse_click_left(int(boss_card["x"]), int(boss_card["y"]), jitter=False)
-            self._sleep_interruptible(random.uniform(0.12, 0.24))
-            mouse_click_left(int(summon["x"]), int(summon["y"]), jitter=False)
+            # 拟人化点击：读取后随机停顿，贝塞尔曲线移动 + 轻微抖动
+            self._sleep_interruptible(random.uniform(0.15, 0.4))
+            mouse_click_left(int(boss_card["x"]), int(boss_card["y"]), jitter=True)
+            self._sleep_interruptible(random.uniform(0.15, 0.35))
+            mouse_click_left(int(summon["x"]), int(summon["y"]), jitter=True)
             self._sleep_interruptible(self.count_post_click_wait)
 
             # 召唤后快速核对：识别到下降立即确认；读不到最多约 2 秒后按消耗 1 张继续
@@ -2277,8 +2293,8 @@ class AutoClicker:
             if not self.count_auto_next:
                 self._set_status(f"已召唤 {progress} 次，连续循环已关闭，自动停止")
                 break
-            self._set_status(f"等待击杀 Boss 后进入下一轮（{format_seconds(self.count_next_cycle_wait)}）")
-            self._sleep_interruptible(self.count_next_cycle_wait)
+            self._set_status(
+                f"本轮完成（{progress}/{guard.target}），等待击杀 Boss，击杀后自动衔接下一轮……")
 
     def _click_rounds(self):
         while self.running:

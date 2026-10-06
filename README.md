@@ -7,7 +7,7 @@
 
 ## 下载
 
-**直接下载最新版 exe：** 👉 [AutoClicker-v36.exe](https://github.com/xyz0218xy-ops/auto-clicker/releases/download/v36/AutoClicker-v36.exe)
+**直接下载最新版 exe：** 👉 [AutoClicker-v37.exe](https://github.com/xyz0218xy-ops/auto-clicker/releases/download/v37/AutoClicker-v37.exe)
 
 > 无需安装 Python，建议右键「以管理员身份运行」。历史版本与更新公告见 [Releases 页面](https://github.com/xyz0218xy-ops/auto-clicker/releases)。
 
@@ -29,18 +29,17 @@
 
 详见 [CHANGELOG.md](CHANGELOG.md)
 
-### 最新 v36 (2026-10-05)
-- Boss 卡数量识别换成三层混合引擎：自学习模板 → Windows OCR → Tesseract 兜底，常规 50~150ms 出结果
-- 新增「学习数字」按钮与「测试读取」三层耗时显示
-- 修复卡在「核对召唤后数量」：最多约 2 秒快速核对，读不到按已消耗 1 张继续并提示
-- 计数模式启动时预热识别引擎，消除首次 2~3 秒冷启动
-- 打包内置精简 Tesseract、WinRT OCR、keyboard、Pillow、pytesseract
-- 自由循环模式、全部热键、按住任意键功能不变
-- 更新公告详见 [release-notes-v36.md](release-notes-v36.md)
+### 最新 v37 (2026-10-07)
+- 击杀 Boss 后自动衔接下一轮：持续轮询召唤界面，不再有固定等待，也不再需要停止重启
+- 隐藏 Tesseract 识别弹窗，运行过程无黑色控制台闪现
+- 拟人化节奏：随机停顿、贝塞尔曲线移动、±2px 抖动、轮询间隔随机化
+- 「下一轮」输入框改为「轮询间隔」，默认 1.2 秒
+- v36 三层识别、自学习模板、核对防卡死全部保留
+- 更新公告详见 [release-notes-v37.md](release-notes-v37.md)
 
 ## 快速开始
 
-1. 下载 [AutoClicker-v36.exe](https://github.com/xyz0218xy-ops/auto-clicker/releases/download/v36/AutoClicker-v36.exe)
+1. 下载 [AutoClicker-v37.exe](https://github.com/xyz0218xy-ops/auto-clicker/releases/download/v37/AutoClicker-v37.exe)
 2. 点「采集点击」→ 3 秒内把鼠标移到目标位置
 3. 按 F12 开始 / 停止
 4. 建议右键「以管理员身份运行」

@@ -16,7 +16,9 @@ import io
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -552,6 +554,41 @@ def probe_winrt_ocr(image):
 
 # ── 第三层：Tesseract 兜底 ─────────────────────────────────────────────────
 
+
+def _run_tesseract_hidden(image, command, tessdata_dir, config):
+    """隐藏窗口调用 tesseract.exe（消除识别时的黑色控制台弹窗），返回 stdout 文本。"""
+    path = None
+    try:
+        handle, path = tempfile.mkstemp(prefix="acr_", suffix=".png")
+        os.close(handle)
+        image.save(path, format="PNG")
+        env = dict(os.environ)
+        env["TESSDATA_PREFIX"] = os.path.abspath(tessdata_dir)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+        result = subprocess.run(
+            [command, path, "stdout"] + config.split(),
+            capture_output=True,
+            timeout=20,
+            creationflags=creationflags,
+            startupinfo=startupinfo,
+            env=env,
+        )
+        return result.stdout.decode("utf-8", "replace")
+    except Exception:
+        return None
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def read_tesseract(image, command=None, tessdata_dir=None):
     """第三层 Tesseract：裁剪数字条放大 3 倍，PSM 7/10/13 + 数字白名单。"""
     if not HAS_PYTesseract or image is None:
@@ -561,7 +598,6 @@ def read_tesseract(image, command=None, tessdata_dir=None):
     if not command or not tessdata_dir or not os.path.isfile(os.path.join(tessdata_dir, "eng.traineddata")):
         return None
     try:
-        pytesseract.pytesseract.tesseract_cmd = command
         os.environ["TESSDATA_PREFIX"] = os.path.abspath(tessdata_dir)
         crop = image
         boxes = _segment_digit_boxes(image)
@@ -578,7 +614,7 @@ def read_tesseract(image, command=None, tessdata_dir=None):
         votes = {}
         for psm in ("7", "10", "13"):
             config = "--psm %s -c tessedit_char_whitelist=0123456789" % psm
-            text = pytesseract.image_to_string(prepared, config=config)
+            text = _run_tesseract_hidden(prepared, command, tessdata_dir, config)
             value = clean_digits(text)
             if value is not None:
                 votes[value] = votes.get(value, 0) + 1
@@ -699,12 +735,12 @@ def warm_up_ocr(region=None, command=None, tessdata_dir=None):
         try:
             command = command or resolve_tesseract()
             tessdata_dir = tessdata_dir or resolve_tessdata(command)
-            pytesseract.pytesseract.tesseract_cmd = command
             if tessdata_dir:
                 os.environ["TESSDATA_PREFIX"] = os.path.abspath(tessdata_dir)
-            pytesseract.get_tesseract_version()
-            pytesseract.image_to_string(
+            _run_tesseract_hidden(
                 Image.new("L", (48, 24), 255),
+                command,
+                tessdata_dir,
                 config="--psm 7 -c tessedit_char_whitelist=0123456789")
         except Exception:
             pass

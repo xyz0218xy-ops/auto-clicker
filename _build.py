@@ -16,7 +16,7 @@ try:
 except ImportError:
     pefile = None
 
-APP_VERSION = "v36"
+APP_VERSION = "v37"
 PYTHON = r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\python.exe"
 TCL_SRC = r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\tcl"
 DLL_SRC = r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\DLLs"

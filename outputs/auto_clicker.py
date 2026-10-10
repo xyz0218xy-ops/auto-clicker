@@ -28,6 +28,13 @@ import time
 import traceback
 import uuid
 
+try:
+    import keyboard as _keyboard
+    HAS_GLOBAL_HOTKEY = True
+except Exception:
+    _keyboard = None
+    HAS_GLOBAL_HOTKEY = False
+
 
 # ── 打包后 Tcl/Tk 运行库引导 ────────────────────────────────────────────────
 # PyInstaller 打包成 exe 后，Tcl 只认「相对路径」或它自己算出来的路径，
@@ -183,7 +190,7 @@ HAS_KEYBOARD = True
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v40"
+APP_VERSION = "v41"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -2206,20 +2213,50 @@ class AutoClicker:
 
     # ── 全局热键 ────────────────────────────────────────────────────────────
     def _register_hotkey(self):
+        """注册全局热键，并保留 Win32/状态轮询后备。"""
         self._unregister_hotkey()
         if self.hotkey and not key_name_to_vk(self.hotkey):
             self.status_var.set(f"热键 {key_display(self.hotkey)} 无法转换为 Windows 键码")
         if self.right_hotkey and self.right_hotkey != self.hotkey and not key_name_to_vk(self.right_hotkey):
             self.status_var.set(f"热键 {key_display(self.right_hotkey)} 无法转换为 Windows 键码")
+
+        # keyboard 使用低级键盘钩子，不依赖当前窗口焦点；这是主后端。
+        # Win32 RegisterHotKey 和 GetAsyncKeyState 继续运行，覆盖钩子权限或
+        # 某些桌面环境不允许安装低级钩子的情况。
+        if HAS_GLOBAL_HOTKEY:
+            if self.hotkey:
+                try:
+                    self.hotkey_handle = _keyboard.add_hotkey(
+                        self.hotkey, self._on_hotkey, suppress=False)
+                except Exception as exc:
+                    self.hotkey_handle = None
+                    self._log_debug("全局启停热键注册失败：%s" % exc)
+            if self.right_hotkey and self.right_hotkey != self.hotkey:
+                try:
+                    self.right_hotkey_handle = _keyboard.add_hotkey(
+                        self.right_hotkey, self._on_right_hotkey, suppress=False)
+                except Exception as exc:
+                    self.right_hotkey_handle = None
+                    self._log_debug("全局按住键热键注册失败：%s" % exc)
+
         self._win_hotkey_stop = threading.Event()
         self._win_hotkey_thread = threading.Thread(
             target=self._win_hotkey_worker, args=(self._win_hotkey_stop,), daemon=True)
         self._win_hotkey_thread.start()
 
-
     def _unregister_hotkey(self):
-        self._win_hotkey_stop.set()
-        worker = self._win_hotkey_thread
+        if HAS_GLOBAL_HOTKEY:
+            for handle in (getattr(self, "hotkey_handle", None),
+                           getattr(self, "right_hotkey_handle", None)):
+                if handle is not None:
+                    try:
+                        _keyboard.remove_hotkey(handle)
+                    except Exception:
+                        pass
+        stop_event = getattr(self, "_win_hotkey_stop", None)
+        if stop_event is not None:
+            stop_event.set()
+        worker = getattr(self, "_win_hotkey_thread", None)
         if worker and worker.is_alive() and worker is not threading.current_thread():
             worker.join(timeout=0.5)
         self._win_hotkey_thread = None
@@ -2876,6 +2913,7 @@ def run_selftest():
         f"数据文件可写：{'是' if os.access(os.path.dirname(CONFIG_PATH), os.W_OK) else '否'}",
         f"方案数量：{len(cfg['profiles'])}（{', '.join(cfg['profiles'].keys())}）",
         "键盘输入：ctypes SendInput 可用",
+        f"全局热键库：{'可用' if HAS_GLOBAL_HOTKEY else '不可用（使用 Win32/状态轮询后备）'}",
         "热键：启停 {} / 按住键 {}({}) / 运行开始时同步按住键：{}".format(
             key_display(cfg["profiles"][cfg["current_profile"]]["hotkey"]),
             key_display(cfg["profiles"][cfg["current_profile"]].get("hold_key", "right")),

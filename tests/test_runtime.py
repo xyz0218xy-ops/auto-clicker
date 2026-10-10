@@ -97,6 +97,33 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(loaded["current_profile"], "已有方案")
         self.assertEqual(len(loaded["profiles"]["已有方案"]["items"]), 1)
 
+    def test_global_hotkey_backend_registers_outside_focus(self):
+        class FakeKeyboard:
+            def __init__(self):
+                self.added = []
+                self.removed = []
+            def add_hotkey(self, name, callback, suppress=False):
+                self.added.append((name, callback, suppress))
+                return len(self.added)
+            def remove_hotkey(self, handle):
+                self.removed.append(handle)
+
+        fake = FakeKeyboard()
+        app = auto_clicker.AutoClicker.__new__(auto_clicker.AutoClicker)
+        app.hotkey = "f12"
+        app.right_hotkey = "f8"
+        app.hotkey_handle = None
+        app.right_hotkey_handle = None
+        app._win_hotkey_stop = threading.Event()
+        app._win_hotkey_thread = None
+        app._win_hotkey_worker = lambda stop: stop.wait()
+        with patch.object(auto_clicker, "_keyboard", fake), patch.object(auto_clicker, "HAS_GLOBAL_HOTKEY", True):
+            app._register_hotkey()
+            self.assertEqual([item[0] for item in fake.added], ["f12", "f8"])
+            self.assertTrue(all(item[2] is False for item in fake.added))
+            app._unregister_hotkey()
+        self.assertEqual(fake.removed, [1, 2])
+
     def test_hotkey_reregistration_stops_previous_worker(self):
         app = auto_clicker.AutoClicker.__new__(auto_clicker.AutoClicker)
         app.hotkey = "f12"

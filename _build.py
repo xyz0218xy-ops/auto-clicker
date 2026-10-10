@@ -17,7 +17,7 @@ try:
 except ImportError:
     pefile = None
 
-APP_VERSION = "v40"
+APP_VERSION = "v41"
 PYTHON = os.environ.get("PYTHON_EXECUTABLE", sys.executable)
 TCL_SRC = os.path.join(sys.prefix, "tcl")
 DLL_SRC = os.path.join(sys.prefix, "DLLs")
@@ -131,6 +131,7 @@ def main():
         "--hidden-import", "PIL.ImageOps",
         "--hidden-import", "PIL.ImageFilter",
         "--hidden-import", "pytesseract",
+        "--hidden-import", "keyboard",
         "--hidden-import", "winrt.windows.media.ocr",
         "--hidden-import", "winrt.windows.graphics.imaging",
         "--hidden-import", "winrt.windows.storage.streams",

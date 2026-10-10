@@ -11,7 +11,7 @@
 
 > 无需安装 Python，建议右键「以管理员身份运行」。历史版本与更新公告见 [Releases 页面](https://github.com/xyz0218xy-ops/auto-clicker/releases)。
 
-当前工作副本为 v40，尚未发布到 GitHub Releases。本地构建产物在 `outputs/dist/AutoClicker-v40.exe`，修复内容见 [release-notes-v40.md](release-notes-v40.md)。
+当前工作副本为 v41，尚未发布到 GitHub Releases。本地构建产物在 `outputs/dist/AutoClicker-v41.exe`，修复内容见 [release-notes-v41.md](release-notes-v41.md)。
 
 ## 功能
 
@@ -31,7 +31,7 @@
 
 详见 [CHANGELOG.md](CHANGELOG.md)
 
-### 当前工作副本 v40 (2026-10-10)
+### 当前工作副本 v41 (2026-10-11)
 - 兼容带 UTF-8 BOM 的配置文件，避免旧方案被误当成空方案
 - 修复热键重新设置后的线程切换，优化 Boss 卡 OCR 等待与错误提示
 - 缩小采集列表字号与序号列宽；更新离线 RapidOCR 打包支持
@@ -40,6 +40,7 @@
 - 新增 `tools/vision_benchmark.py`，比较当前后端、OpenCV 模板和可选 MaaFramework 模块，输出 JSON/CSV 延迟与准确率
 - 预热按配置只初始化实际使用的视觉后端；默认路径不加载 RapidOCR，Windows OCR 只创建引擎，首次启动等待从约 1 秒降到约 30–40 ms
 - 视觉区域连续 3 次识别失败时自动暂停，状态栏和 `debug.log` 写出具体区域坐标，避免无限刷“读取失败”
+- 恢复 `keyboard` 低级钩子作为全局热键主后端；焦点在其他窗口时也能触发，Win32 注册和状态轮询继续作为后备
 
 ### GitHub 已发布 v37 (2026-10-07)
 - 击杀 Boss 后自动衔接下一轮：持续轮询召唤界面，不再有固定等待，也不再需要停止重启
@@ -60,7 +61,7 @@
 ## 打包
 
 ```powershell
-py -3.14 -m pip install pyinstaller pillow pytesseract rapidocr-onnxruntime onnxruntime opencv-python
+py -3.14 -m pip install pyinstaller pillow pytesseract keyboard rapidocr-onnxruntime onnxruntime opencv-python
 powershell -ExecutionPolicy Bypass -File outputs\build_exe.ps1
 ```
 

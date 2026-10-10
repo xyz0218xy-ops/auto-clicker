@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """自动点击器 —— 鼠标 / 键盘自动化工具
 
 功能概览：
@@ -183,7 +183,7 @@ HAS_KEYBOARD = True
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v39"
+APP_VERSION = "v40"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -2583,12 +2583,17 @@ class AutoClicker:
         command = resolve_tesseract()
         tessdata_dir = resolve_tessdata(command)
         self._set_status("正在预热视觉监控 OCR 引擎……")
-        warm_up_ocr(command=command, tessdata_dir=tessdata_dir)
+        warm_up_ocr(
+            command=command,
+            tessdata_dir=tessdata_dir,
+            backend=getattr(self, "vision_backend", DEFAULT_VISION_BACKEND),
+        )
         monitor = MultiCounterMonitor(
             counters,
             stop_mode=self.vision_stop_mode,
             stable_samples=self.vision_stable_samples,
         )
+        failure_rounds = {counter["id"]: 0 for counter in counters if counter.get("enabled")}
         while self.running and not monitor.triggered:
             snapshot = {}
             details = []
@@ -2603,8 +2608,24 @@ class AutoClicker:
                     budget_ms=getattr(self, "vision_deadline_ms", DEFAULT_VISION_DEADLINE_MS),
                     backend=getattr(self, "vision_backend", DEFAULT_VISION_BACKEND),
                 )
-                snapshot[counter["id"]] = value
-                details.append(f"{counter['name']}={value if value is not None else '?'}")
+                counter_id = counter["id"]
+                snapshot[counter_id] = value
+                if value is None:
+                    failure_rounds[counter_id] += 1
+                    x, y, width, height = parse_region(counter["region"], DEFAULT_COUNT_REGION)
+                    details.append(f"{counter['name']}=?({x},{y},{width},{height})")
+                else:
+                    failure_rounds[counter_id] = 0
+                    details.append(f"{counter['name']}={value}")
+                if failure_rounds[counter_id] >= 3:
+                    region_text = ",".join(str(item) for item in parse_region(counter["region"], DEFAULT_COUNT_REGION))
+                    message = (
+                        f"{counter['name']}数量区域连续 3 次识别失败（区域 {region_text}）。"
+                        "请重新采集区域或确认目标画面可见"
+                    )
+                    self._log_debug(message)
+                    self._set_status("视觉监控已暂停：" + message)
+                    raise CountSafetyError(message)
             triggered, events = monitor.observe(snapshot)
             event_text = "，".join(f"{counter_id}:{event}" for counter_id, event in events.items() if event)
             self._set_status(f"视觉监控：{'，'.join(details)} | {event_text}")
@@ -2631,7 +2652,12 @@ class AutoClicker:
 
         # 后台预热 OCR 引擎，消除首次调用约 1-3 秒的冷启动延迟
         self._set_status("正在预热 OCR 引擎……")
-        warm_ms = warm_up_ocr(region, command=command, tessdata_dir=tessdata_dir)
+        warm_ms = warm_up_ocr(
+            region,
+            command=command,
+            tessdata_dir=tessdata_dir,
+            backend=getattr(self, "vision_backend", DEFAULT_VISION_BACKEND),
+        )
         self._set_status(f"OCR 引擎预热完成（{warm_ms:.0f} ms）")
 
         verify_timeout = max(1.0, min(2.0, self.count_post_click_wait))

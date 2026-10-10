@@ -53,6 +53,33 @@ class RuntimeTests(unittest.TestCase):
         tesseract.assert_not_called()
         self.assertIsNone(result.value)
         self.assertLessEqual(result.elapsed_ms, 250)
+    def test_warmup_default_does_not_initialize_rapidocr(self):
+        with patch.object(count_mode, "read_rapidocr") as rapid, \
+                patch.object(count_mode, "read_winocr", return_value=None), \
+                patch.object(count_mode, "_winrt_engine", return_value=None):
+            count_mode.warm_up_ocr(backend="template_winocr")
+        rapid.assert_not_called()
+
+    def test_vision_monitor_pauses_after_repeated_region_failures(self):
+        app = auto_clicker.AutoClicker.__new__(auto_clicker.AutoClicker)
+        app.running = True
+        app.vision_stop_mode = "left"
+        app.vision_stable_samples = 3
+        app.vision_poll_interval = 0
+        app.vision_deadline_ms = 100
+        app.vision_backend = "template_winocr"
+        statuses, logs = [], []
+        app._set_status = statuses.append
+        app._log_debug = logs.append
+        app._sleep_interruptible = lambda _seconds: None
+        counters = [{"id": "mid", "name": "中间", "region": [10, 20, 30, 12], "threshold": 0, "enabled": True, "primary": True}]
+        with patch.object(auto_clicker, "warm_up_ocr"), \
+                patch.object(auto_clicker, "read_count_fast", return_value=(None, 100, None)):
+            with self.assertRaises(auto_clicker.CountSafetyError):
+                app._run_vision_threshold_mode(counters)
+        self.assertTrue(any("暂停" in item and "10,20,30,12" in item for item in statuses))
+        self.assertTrue(any("连续 3 次识别失败" in item for item in logs))
+
     def test_bom_config_keeps_existing_profiles(self):
         config = {
             "version": 2,

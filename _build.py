@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """打包脚本：复制 Tcl/Tk 运行库、暂存 Tesseract 最小依赖，然后运行 PyInstaller 生成单文件 exe。
 
 Tcl/Tk：必须显式打包 tcl8.6 / tk8.6 目录、tcl86t.dll、tk86t.dll 与 _tkinter.pyd，
@@ -17,7 +17,7 @@ try:
 except ImportError:
     pefile = None
 
-APP_VERSION = "v39"
+APP_VERSION = "v40"
 PYTHON = os.environ.get("PYTHON_EXECUTABLE", sys.executable)
 TCL_SRC = os.path.join(sys.prefix, "tcl")
 DLL_SRC = os.path.join(sys.prefix, "DLLs")

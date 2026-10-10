@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """Boss 卡计数模式的数字识别（多层混合）与安全状态机。
 
 识别顺序：
@@ -12,6 +12,7 @@
 """
 
 import asyncio
+import concurrent.futures
 import hashlib
 import io
 import os
@@ -954,23 +955,48 @@ def read_count_stable(region, samples=2, delay=0.05, command=None, tessdata_dir=
     return value, len(backend.last_consistent_values), list(backend.last_consistent_values)
 
 
-def warm_up_ocr(region=None, command=None, tessdata_dir=None, include_diagnostic=False):
-    """预热实时视觉后端；Tesseract 只有人工诊断时才允许预热。"""
+def warm_up_ocr(region=None, command=None, tessdata_dir=None,
+                include_diagnostic=False, backend="template_winocr"):
+    """只预热当前实时路径需要的后端，返回总耗时毫秒。
+
+    默认路径不初始化 RapidOCR；显式启用 RapidOCR 时与 Windows OCR 并行
+    初始化，避免两个独立的冷启动耗时相加。Tesseract 仅人工诊断时预热。
+    """
     started = time.perf_counter()
-    if HAS_RAPIDOCR:
+    backend = str(backend or "template_winocr")
+    use_rapidocr = backend == "template_winocr_rapidocr"
+    use_winocr = backend in ("template_winocr", "template_winocr_rapidocr", "winocr_template")
+
+    def warm_rapidocr():
+        if not use_rapidocr or not HAS_RAPIDOCR or not HAS_PIL:
+            return
         try:
-            probe = Image.new("L", (48, 24), 255)
-            read_rapidocr(probe)
+            read_rapidocr(Image.new("L", (48, 24), 255))
         except Exception:
             pass
-    if HAS_WINRT_OCR:
+
+    def warm_winocr():
+        if not use_winocr or not HAS_WINRT_OCR:
+            return
         try:
-            engine = _winrt_engine()
-            if engine is not None:
-                probe = Image.new("L", (48, 24), 255)
-                read_winocr(probe)
+            # 创建引擎即可完成 Windows OCR 的主要冷启动；空图识别会额外消耗
+            # 约 200 ms，留给第一次真实画面识别，缩短用户等待时间。
+            _winrt_engine()
         except Exception:
             pass
+
+    if use_rapidocr and use_winocr:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(warm_rapidocr), executor.submit(warm_winocr)]
+            for future in futures:
+                try:
+                    future.result()
+                except Exception:
+                    pass
+    else:
+        warm_rapidocr()
+        warm_winocr()
+
     if include_diagnostic and _tesseract_ready(command, tessdata_dir):
         try:
             command = command or resolve_tesseract()

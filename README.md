@@ -11,6 +11,8 @@
 
 > 无需安装 Python，建议右键「以管理员身份运行」。历史版本与更新公告见 [Releases 页面](https://github.com/xyz0218xy-ops/auto-clicker/releases)。
 
+当前工作副本为 v39，尚未发布到 GitHub Releases。本地构建产物在 `outputs/dist/AutoClicker-v39.exe`，修复内容见 [release-notes-v39.md](release-notes-v39.md)。
+
 ## 功能
 
 - **采集点击**：3 秒倒计时后记录鼠标坐标
@@ -29,7 +31,15 @@
 
 详见 [CHANGELOG.md](CHANGELOG.md)
 
-### 最新 v37 (2026-10-07)
+### 当前工作副本 v39 (2026-10-10)
+- 兼容带 UTF-8 BOM 的配置文件，避免旧方案被误当成空方案
+- 修复热键重新设置后的线程切换，优化 Boss 卡 OCR 等待与错误提示
+- 缩小采集列表字号与序号列宽；更新离线 RapidOCR 打包支持
+- 实时视觉路径增加统一 `VisionBackend`，默认模板匹配 + Windows OCR，截止时间 850 ms；RapidOCR 仅显式启用，Tesseract 只用于人工诊断
+- Boss 卡动作采用 `pending` 两阶段记录：点击前落盘，连续两次识别一致后提交；中断重启自动按已消耗一次结算
+- 新增 `tools/vision_benchmark.py`，比较当前后端、OpenCV 模板和可选 MaaFramework 模块，输出 JSON/CSV 延迟与准确率
+
+### GitHub 已发布 v37 (2026-10-07)
 - 击杀 Boss 后自动衔接下一轮：持续轮询召唤界面，不再有固定等待，也不再需要停止重启
 - 隐藏 Tesseract 识别弹窗，运行过程无黑色控制台闪现
 - 拟人化节奏：随机停顿、贝塞尔曲线移动、±2px 抖动、轮询间隔随机化
@@ -48,8 +58,16 @@
 ## 打包
 
 ```powershell
-python -m pip install keyboard pyinstaller pillow pytesseract
+py -3.14 -m pip install pyinstaller pillow pytesseract rapidocr-onnxruntime onnxruntime opencv-python
 powershell -ExecutionPolicy Bypass -File outputs\build_exe.ps1
+```
+
+## 离线视觉基准
+
+基准工具只读取脱敏图片，不发送输入事件。样本按 `summon_visible`、`boss_alive`、`boss_defeated`、`low_confidence` 分类；可为每张图片放置同名 JSON，填写 `value`、`resolution`、`dpi`、`region` 和 `allow_action`。
+
+```powershell
+py -3 tools\vision_benchmark.py samples --json vision-benchmark.json --csv vision-benchmark.csv
 ```
 
 ## 免责说明
@@ -57,3 +75,4 @@ powershell -ExecutionPolicy Bypass -File outputs\build_exe.ps1
 - 本工具仅用于合法的自动化测试场景，请确认使用行为符合目标软件的用户协议。
 - 本工具通过软件层模拟输入（SendInput），不涉及游戏进程注入或内存修改。
 - 本工具不提供、不宣传反作弊或游戏检测绕过功能。
+- 不加入配置或模型加密，也不保证客户端无法被分析；保留 SHA-256、发布签名和详细诊断日志供审计。

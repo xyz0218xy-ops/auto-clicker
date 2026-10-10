@@ -1,10 +1,11 @@
 ﻿# -*- coding: utf-8 -*-
-"""Boss 卡计数模式的数字识别（三层混合）与安全状态机。
+"""Boss 卡计数模式的数字识别（多层混合）与安全状态机。
 
-三层识别：
+识别顺序：
 1. 模板匹配：OpenCV 自适应二值化 + 轮廓分割数字，与自学习模板做归一化相关匹配；
 2. Windows OCR：winrt-Windows.Media.Ocr（zh-Hans-CN），浅色背景 2 倍放大；
-3. Tesseract 兜底：裁剪数字条 3 倍放大 + PSM 7/10/13 + 数字白名单。
+3. RapidOCR：离线 ONNX Runtime，纯数字识别（显式选择时启用）；
+4. Tesseract：仅人工诊断，不进入实时动作链路。
 
 自学习：OCR 成功且分割出的数字个数与结果一致时，把每个数字模板保存为 PNG，
 按数字 0-9 归类到 count_templates/ 目录（与配置同目录），永久保存、越用越准。
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 
 try:
     from PIL import ImageGrab, ImageOps, Image
@@ -48,6 +50,18 @@ except Exception:
     HAS_PYTesseract = False
 
 try:
+    from rapidocr import RapidOCR as _RapidOCR
+    HAS_RAPIDOCR = True
+except Exception:
+    try:
+        from rapidocr_onnxruntime import RapidOCR as _RapidOCR
+        HAS_RAPIDOCR = True
+    except Exception:
+        _RapidOCR = None
+        HAS_RAPIDOCR = False
+RAPIDOCR_LEGACY = HAS_RAPIDOCR and _RapidOCR.__module__.startswith("rapidocr_onnxruntime")
+
+try:
     import winrt.windows.media.ocr as _winrt_ocr
     import winrt.windows.graphics.imaging as _winrt_imaging
     import winrt.windows.storage.streams as _winrt_streams
@@ -71,10 +85,14 @@ _LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS
 
 # 模板目录（由主程序在启动时调用 set_template_dir 指定，默认放模块同目录）
 _template_dir = None
+_template_namespace = None
 _template_cache = None
 _engine_cache = {}
 _engine_lock = threading.Lock()
 _ocr_lock = threading.Lock()
+_rapidocr_lock = threading.Lock()
+_rapidocr_engine = None
+_rapidocr_params = {}
 _loop_local = threading.local()
 
 
@@ -82,16 +100,145 @@ class CountSafetyError(RuntimeError):
     """OCR 结果或数量变化不满足安全条件时抛出。"""
 
 
-def set_template_dir(directory):
+@dataclass
+class VisionReading:
+    """一次视觉读取的可审计结果。"""
+
+    value: object = None
+    confidence: float = 0.0
+    elapsed_ms: float = 0.0
+    backend: str = ""
+    frame_id: int = 0
+    error: str = ""
+
+
+class VisionBackend:
+    """实时视觉后端。
+
+    默认实时顺序为模板、Windows OCR；显式选择 ``template_winocr_rapidocr``
+    时追加 RapidOCR。Tesseract 只通过 ``read_count_debug`` 进入人工诊断。
+    """
+
+    ORDER = ("template", "winocr", "rapidocr")
+    CONFIDENCE = {"template": 0.95, "winocr": 0.78, "rapidocr": 0.70}
+    LABELS = {"template": "模板", "winocr": "WinOCR", "rapidocr": "RapidOCR"}
+
+    def __init__(self, deadline_ms=850, backend="template_winocr"):
+        self.deadline_ms = max(1.0, min(1000.0, float(deadline_ms or 850)))
+        self.backend = str(backend or "template_winocr")
+        self._frame_id = 0
+        self.last_reading = VisionReading()
+        self.last_consistent_reading = VisionReading()
+        self.last_consistent_values = []
+
+    def _order(self):
+        if self.backend == "template_winocr":
+            return ("template", "winocr")
+        if self.backend == "template_winocr_rapidocr":
+            return self.ORDER
+        if self.backend == "winocr_template":
+            return ("winocr", "template", "rapidocr")
+        return self.ORDER
+
+    def _next_frame_id(self):
+        self._frame_id += 1
+        return self._frame_id
+
+    def read_image(self, image, deadline_ms=None):
+        """对已截取图像读取一次，供实时路径和离线基准共用。"""
+        started = time.perf_counter()
+        frame_id = self._next_frame_id()
+        limit = self.deadline_ms if deadline_ms is None else max(1.0, float(deadline_ms))
+        result = VisionReading(frame_id=frame_id)
+        if image is None:
+            result.error = "图像为空"
+            result.elapsed_ms = (time.perf_counter() - started) * 1000
+            self.last_reading = result
+            return result
+        readers = {
+            "template": lambda: read_templates(image)[0],
+            "winocr": lambda: read_winocr(image),
+            "rapidocr": lambda: read_rapidocr(image),
+        }
+        for name in self._order():
+            if (time.perf_counter() - started) * 1000 >= limit:
+                result.error = "超过视觉截止时间"
+                break
+            try:
+                value = readers[name]()
+            except Exception as exc:
+                value = None
+                result.error = "%s: %s" % (name, exc)
+            if value is not None:
+                result.value = int(value)
+                result.confidence = self.CONFIDENCE[name]
+                result.backend = self.LABELS[name]
+                break
+        result.elapsed_ms = (time.perf_counter() - started) * 1000
+        if result.value is None and not result.error:
+            result.error = "未识别"
+        self.last_reading = result
+        return result
+
+    def read(self, region, deadline_ms=None):
+        """截屏并读取一次，结果包含耗时、后端和帧编号。"""
+        return self.read_image(capture_region(region), deadline_ms=deadline_ms)
+
+    def read_consistent(self, region, max_ms=850, reads=2, delay_ms=15):
+        """在截止时间内要求连续 ``reads`` 次得到相同数字，失败返回 None。"""
+        started = time.perf_counter()
+        limit = max(1.0, min(1000.0, float(max_ms or self.deadline_ms)))
+        required = max(2, int(reads))
+        previous = None
+        same = 0
+        self.last_consistent_values = []
+        last = VisionReading(error="未完成一致确认")
+        while (time.perf_counter() - started) * 1000 < limit:
+            remaining = max(1.0, limit - (time.perf_counter() - started) * 1000)
+            last = self.read(region, deadline_ms=remaining)
+            self.last_consistent_values.append(last.value)
+            if last.value is not None and last.value == previous:
+                same += 1
+            elif last.value is not None:
+                previous = last.value
+                same = 1
+            else:
+                previous = None
+                same = 0
+            if same >= required:
+                self.last_consistent_reading = last
+                return last.value
+            if delay_ms > 0:
+                time.sleep(min(float(delay_ms) / 1000.0,
+                               max(0.0, (limit - (time.perf_counter() - started) * 1000) / 1000.0)))
+        self.last_consistent_reading = VisionReading(
+            value=None,
+            elapsed_ms=(time.perf_counter() - started) * 1000,
+            backend=last.backend,
+            frame_id=last.frame_id,
+            error="未在 %.0f ms 内完成 %d 次一致确认" % (limit, required),
+        )
+        return None
+
+
+def set_template_dir(directory, namespace=None):
     """设置数字模板目录（与配置文件同目录，方便随数据迁移）。"""
-    global _template_dir, _template_cache
+    global _template_dir, _template_namespace, _template_cache
     _template_dir = os.path.abspath(directory) if directory else None
+    _template_namespace = str(namespace).strip() if namespace else None
+    _template_cache = None
+
+
+def set_template_namespace(namespace):
+    """切换当前模板命名空间，便于左、中、右三块数字分别维护模板。"""
+    global _template_namespace, _template_cache
+    _template_namespace = str(namespace).strip() if namespace else None
     _template_cache = None
 
 
 def get_template_dir():
     if _template_dir:
-        return _template_dir
+        return os.path.join(_template_dir, _template_namespace) if _template_namespace else _template_dir
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "count_templates")
 
 
@@ -156,9 +303,76 @@ def _tesseract_ready(command=None, tessdata_dir=None):
     )
 
 
+def set_rapidocr_params(params=None):
+    """设置 RapidOCR 参数，例如本地模型目录与只启用 rec 模型。"""
+    global _rapidocr_params, _rapidocr_engine
+    _rapidocr_params = dict(params or {})
+    _rapidocr_engine = None
+
+
+def rapid_ocr_available():
+    """RapidOCR 是否已经可导入。"""
+    return HAS_RAPIDOCR
+
+
+def _rapidocr_engine_instance():
+    """延迟创建并缓存 RapidOCR 实例。"""
+    global _rapidocr_engine
+    if not HAS_RAPIDOCR:
+        return None
+    if _rapidocr_engine is None:
+        with _rapidocr_lock:
+            if _rapidocr_engine is None:
+                if RAPIDOCR_LEGACY:
+                    _rapidocr_engine = _RapidOCR(
+                        use_text_det=False, use_angle_cls=False, print_verbose=False)
+                else:
+                    _rapidocr_engine = _RapidOCR(params=_rapidocr_params or None)
+    return _rapidocr_engine
+
+
+def read_rapidocr(image):
+    """RapidOCR 只识别纯数字，返回整数或 None。"""
+    if not HAS_RAPIDOCR or not HAS_PIL or image is None:
+        return None
+    try:
+        prepared = _prepare_for_ocr(image, scale=2)
+        if prepared is None:
+            return None
+        engine = _rapidocr_engine_instance()
+        if engine is None:
+            return None
+        with _ocr_lock:
+            if RAPIDOCR_LEGACY:
+                result, _elapsed = engine(np.asarray(prepared.convert("RGB")))
+                texts = [item[1] for item in (result or [])]
+            else:
+                result = engine(
+                    np.asarray(prepared.convert("RGB")),
+                    use_det=False,
+                    use_cls=False,
+                    use_rec=True,
+                )
+                texts = getattr(result, "txts", None) or []
+        if texts:
+            return clean_digits(texts[0])
+        return None
+    except Exception:
+        return None
+
+
+def probe_rapidocr(image):
+    """实测一次 RapidOCR，返回 (整数或 None, 耗时毫秒)。"""
+    if not HAS_RAPIDOCR or not HAS_PIL or image is None:
+        return None, 0.0
+    started = time.perf_counter()
+    value = read_rapidocr(image)
+    return value, (time.perf_counter() - started) * 1000
+
+
 def ocr_available():
     """至少有一层识别引擎可用即视为 OCR 可用。"""
-    return HAS_PIL and (HAS_WINRT_OCR or _tesseract_ready())
+    return HAS_PIL and (HAS_RAPIDOCR or HAS_WINRT_OCR or _tesseract_ready())
 
 
 def engine_status():
@@ -168,6 +382,7 @@ def engine_status():
     return {
         "template_dir": get_template_dir(),
         "templates": template_stats(),
+        "rapidocr": HAS_RAPIDOCR,
         "winrt": HAS_WINRT_OCR,
         "tesseract": _tesseract_ready(command, tessdata_dir),
         "tesseract_path": command,
@@ -418,19 +633,23 @@ def template_stats():
     return counts
 
 
-def learn_templates(region, frames=5, delay=0.15, command=None, tessdata_dir=None, callback=None):
+def learn_templates(region, frames=5, delay=0.15, command=None, tessdata_dir=None, callback=None, namespace=None):
     """自学习：截取若干帧，OCR 成功且数字个数与分割结果一致时保存每个数字模板。
 
     返回 {digit: 本次新学到的模板数}。
     """
     learned = {digit: 0 for digit in range(10)}
     frames = max(1, min(20, int(frames)))
+    if namespace:
+        set_template_namespace(namespace)
     for frame_index in range(frames):
         image = capture_region(region)
         if image is not None:
             boxes = _segment_digit_boxes(image)
             if boxes:
-                value = read_winocr(image)
+                value = read_rapidocr(image)
+                if value is None:
+                    value = read_winocr(image)
                 if value is None:
                     value = read_tesseract(image, command=command, tessdata_dir=tessdata_dir)
                 if value is not None:
@@ -573,7 +792,7 @@ def _run_tesseract_hidden(image, command, tessdata_dir, config):
         result = subprocess.run(
             [command, path, "stdout"] + config.split(),
             capture_output=True,
-            timeout=20,
+            timeout=3,
             creationflags=creationflags,
             startupinfo=startupinfo,
             env=env,
@@ -618,6 +837,8 @@ def read_tesseract(image, command=None, tessdata_dir=None):
             value = clean_digits(text)
             if value is not None:
                 votes[value] = votes.get(value, 0) + 1
+                if votes[value] >= 2:
+                    break
         if not votes:
             return None
         return max(votes.items(), key=lambda item: (item[1], item[0]))[0]
@@ -628,12 +849,14 @@ def read_tesseract(image, command=None, tessdata_dir=None):
 # ── 统一读取入口 ───────────────────────────────────────────────────────────
 
 def read_count_debug(region, command=None, tessdata_dir=None):
-    """三层识别并返回各层耗时/结果明细，便于「测试读取」显示。"""
+    """多层识别并返回各层耗时/结果明细，便于「测试读取」显示。"""
     info = {
         "value": None,
         "layer": None,
         "template_value": None,
         "template_ms": 0.0,
+        "rapidocr_value": None,
+        "rapidocr_ms": 0.0,
         "winocr_value": None,
         "winocr_ms": 0.0,
         "tesseract_value": None,
@@ -667,7 +890,16 @@ def read_count_debug(region, command=None, tessdata_dir=None):
         info["value"], info["layer"] = winocr_value, "WinOCR"
         info["total_ms"] = (time.perf_counter() - started) * 1000
         return info
-    # 第三层：Tesseract
+    # 第三层：RapidOCR
+    layer_started = time.perf_counter()
+    rapidocr_value = read_rapidocr(image)
+    info["rapidocr_ms"] = (time.perf_counter() - layer_started) * 1000
+    info["rapidocr_value"] = rapidocr_value
+    if rapidocr_value is not None:
+        info["value"], info["layer"] = rapidocr_value, "RapidOCR"
+        info["total_ms"] = (time.perf_counter() - started) * 1000
+        return info
+    # 第四层：Tesseract
     layer_started = time.perf_counter()
     tesseract_value = read_tesseract(image, command=command, tessdata_dir=tessdata_dir)
     info["tesseract_ms"] = (time.perf_counter() - layer_started) * 1000
@@ -676,6 +908,13 @@ def read_count_debug(region, command=None, tessdata_dir=None):
         info["value"], info["layer"] = tesseract_value, "Tesseract"
     info["total_ms"] = (time.perf_counter() - started) * 1000
     return info
+
+
+def read_count_fast(region, command=None, tessdata_dir=None, budget_ms=850, backend="template_winocr"):
+    """实时读取：模板、Windows OCR、RapidOCR，严格受 1 秒以内截止时间约束。"""
+    limit = 850 if budget_ms is None or float(budget_ms or 0) <= 0 else min(1000, float(budget_ms))
+    reading = VisionBackend(deadline_ms=limit, backend=backend).read(region, deadline_ms=limit)
+    return reading.value, reading.elapsed_ms, reading.backend or None
 
 
 def read_count_once(region, command=None, tessdata_dir=None):
@@ -705,24 +944,25 @@ def read_count_stable(region, samples=2, delay=0.05, command=None, tessdata_dir=
 
     返回 (值 或 None, 已读次数, 原始结果列表)。
     """
-    values = []
-    raw_values = []
-    for _ in range(max(2, int(samples))):
-        value = read_count_once(region, command=command, tessdata_dir=tessdata_dir)
-        raw_values.append(value)
-        if value is not None:
-            values.append(value)
-            if len(values) >= 2 and values[-1] == values[-2]:
-                return values[-1], len(values), raw_values
-        time.sleep(max(0.0, delay))
-    if values:
-        return values[-1], len(values), raw_values
-    return None, len(values), raw_values
+    backend = VisionBackend(deadline_ms=850)
+    value = backend.read_consistent(
+        region,
+        max_ms=850,
+        reads=max(2, int(samples)),
+        delay_ms=max(0.0, float(delay)) * 1000,
+    )
+    return value, len(backend.last_consistent_values), list(backend.last_consistent_values)
 
 
-def warm_up_ocr(region=None, command=None, tessdata_dir=None):
-    """预热 Windows OCR 引擎与 Tesseract，消除首次调用的冷启动延迟。"""
+def warm_up_ocr(region=None, command=None, tessdata_dir=None, include_diagnostic=False):
+    """预热实时视觉后端；Tesseract 只有人工诊断时才允许预热。"""
     started = time.perf_counter()
+    if HAS_RAPIDOCR:
+        try:
+            probe = Image.new("L", (48, 24), 255)
+            read_rapidocr(probe)
+        except Exception:
+            pass
     if HAS_WINRT_OCR:
         try:
             engine = _winrt_engine()
@@ -731,7 +971,7 @@ def warm_up_ocr(region=None, command=None, tessdata_dir=None):
                 read_winocr(probe)
         except Exception:
             pass
-    if _tesseract_ready(command, tessdata_dir):
+    if include_diagnostic and _tesseract_ready(command, tessdata_dir):
         try:
             command = command or resolve_tesseract()
             tessdata_dir = tessdata_dir or resolve_tessdata(command)
@@ -783,3 +1023,118 @@ class CountGuard:
             self.last_remaining = after
             self.last_note = "数量未下降（%d→%d），按已消耗 1 张继续" % (before, after)
         return self.progress, self.last_note
+
+
+class StrictCounter:
+    """单个计数区域的严格状态机：只接受 new == old - 1。"""
+
+    def __init__(self, counter_id, threshold, stable_samples=3, primary=False):
+        self.counter_id = str(counter_id)
+        self.threshold = int(threshold)
+        self.stable_samples = max(2, int(stable_samples))
+        self.primary = bool(primary)
+        self.baseline = None
+        self.stable_value = None
+        self.candidate = None
+        self.candidate_count = 0
+        self.triggered = False
+        self.last_event = ""
+
+    def reset(self):
+        self.baseline = None
+        self.stable_value = None
+        self.candidate = None
+        self.candidate_count = 0
+        self.triggered = False
+        self.last_event = ""
+
+    def observe(self, value):
+        """返回事件说明字符串，调用方根据内容决定是否更新 UI。"""
+        if value is None:
+            self.last_event = "读取失败"
+            return self.last_event
+        value = int(value)
+        if self.stable_value is None:
+            self.stable_value = value
+            if self.baseline is None:
+                self.baseline = value
+                self.last_event = "基线 %d" % value
+            else:
+                self.last_event = "基线重置为 %d" % value
+            self.candidate = None
+            self.candidate_count = 0
+            return self.last_event
+        if value == self.stable_value:
+            self.candidate = None
+            self.candidate_count = 0
+            self.last_event = "无变化"
+            return self.last_event
+        if value == self.stable_value - 1:
+            self.candidate = value
+            self.candidate_count += 1
+            if self.candidate_count >= self.stable_samples:
+                self.stable_value = value
+                self.candidate = None
+                self.candidate_count = 0
+                self.last_event = "减少 1：%d" % value
+            else:
+                self.last_event = "待确认 %d/%d" % (self.candidate_count, self.stable_samples)
+            return self.last_event
+        self.last_event = "异常变化：%d→%d" % (self.stable_value, value)
+        return self.last_event
+
+    @property
+    def below_threshold(self):
+        return self.stable_value is not None and self.stable_value <= self.threshold
+
+
+class MultiCounterMonitor:
+    """多个计数区域联合判断阈值停止。"""
+
+    def __init__(self, counters, stop_mode="left", stable_samples=3):
+        self.counters = {
+            item["id"]: StrictCounter(
+                item["id"],
+                item.get("threshold", 0),
+                stable_samples=item.get("stable_samples", stable_samples),
+                primary=bool(item.get("primary", False)),
+            )
+            for item in counters
+            if item.get("enabled", True)
+        }
+        self.stop_mode = str(stop_mode or "left")
+        self.triggered = False
+
+    def observe(self, snapshot):
+        """snapshot 为 {counter_id: value 或 None}。"""
+        events = {}
+        for counter_id, counter in self.counters.items():
+            events[counter_id] = counter.observe(snapshot.get(counter_id))
+        self.triggered = self.triggered or self._condition_met()
+        return self.triggered, events
+
+    def _condition_met(self):
+        active = [counter for counter in self.counters.values() if counter.stable_value is not None]
+        if not active:
+            return False
+        below = [counter for counter in active if counter.below_threshold]
+        below_ids = {counter.counter_id for counter in below}
+        primary = next((counter for counter in active if counter.primary), None)
+        if self.stop_mode == "left":
+            return bool(primary and primary.counter_id in below_ids)
+        if self.stop_mode == "any":
+            return bool(below)
+        if self.stop_mode == "all":
+            return len(below) == len(active)
+        if self.stop_mode == "left_and_any":
+            return bool(primary and primary.counter_id in below_ids and len(below) >= 2)
+        if self.stop_mode == "left_and_all":
+            return bool(primary and primary.counter_id in below_ids and len(below) == len(active))
+        if self.stop_mode == "pair":
+            return len(below) >= 2
+        return bool(primary and primary.counter_id in below_ids)
+
+    def reset(self):
+        for counter in self.counters.values():
+            counter.reset()
+        self.triggered = False

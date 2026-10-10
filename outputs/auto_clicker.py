@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """自动点击器 —— 鼠标 / 键盘自动化工具
 
 功能概览：
@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 
 
 # ── 打包后 Tcl/Tk 运行库引导 ────────────────────────────────────────────────
@@ -146,35 +147,43 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from count_mode import (
     CountGuard,
     CountSafetyError,
+    MultiCounterMonitor,
+    VisionBackend,
     HAS_PIL as HAS_PIL_OCR,
     HAS_PYTesseract as HAS_PYTesseract_OCR,
+    HAS_RAPIDOCR as HAS_RAPIDOCR_OCR,
+    _segment_digit_boxes,
+    capture_region,
     engine_status,
     learn_templates,
     ocr_available,
     parse_region,
+    probe_rapidocr,
     probe_winrt_ocr,
+    rapid_ocr_available,
     read_count_debug,
+    read_count_fast,
     read_count_quick,
+    read_rapidocr,
+    read_templates,
     read_tesseract,
     resolve_tesseract,
     resolve_tessdata,
+    save_template,
+    set_rapidocr_params,
+    set_template_namespace,
     set_template_dir,
     template_stats,
     warm_up_ocr,
 )
 
-# ── 可选依赖：键盘钩子与按键模拟 ────────────────────────────────────────────
-try:
-    import keyboard
-    HAS_KEYBOARD = True
-except Exception:  # 缺少 keyboard 库时只保留鼠标功能
-    keyboard = None
-    HAS_KEYBOARD = False
+# ── 键盘输入：使用 ctypes SendInput，不再依赖 keyboard 库 ─────────────────
+HAS_KEYBOARD = True
 
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v37"
+APP_VERSION = "v39"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -194,6 +203,18 @@ DEFAULT_COUNT_NEXT_CYCLE_WAIT = 1.2
 DEFAULT_COUNT_AUTO_NEXT = True
 DEFAULT_COUNT_REGION = (0, 0, 120, 36)
 DEFAULT_COUNT_BOSS_CARD_POINT = (0, 0)
+DEFAULT_VISION_STOP_MODE = "left"
+DEFAULT_VISION_STABLE_SAMPLES = 3
+DEFAULT_VISION_POLL_INTERVAL = 0.1
+DEFAULT_VISION_BACKEND = "template_winocr"
+DEFAULT_VISION_DEADLINE_MS = 850
+DEFAULT_CONFIRM_READS = 2
+DEFAULT_PENDING_POLICY = "auto_commit"
+DEFAULT_VISION_COUNTERS = {
+    "left": {"id": "left", "name": "左侧", "region": [0, 0, 120, 36], "threshold": 0, "enabled": True, "primary": True},
+    "mid": {"id": "mid", "name": "中间", "region": [0, 0, 120, 36], "threshold": 0, "enabled": False, "primary": False},
+    "right": {"id": "right", "name": "右侧", "region": [0, 0, 120, 36], "threshold": 0, "enabled": False, "primary": False},
+}
 
 user32 = ctypes.windll.user32
 
@@ -204,9 +225,11 @@ MOUSEEVENTF_RIGHTUP = 0x0010
 
 # --- SendInput ---
 INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_ABSOLUTE = 0x8000
 MOUSEEVENTF_WHEEL = 0x0800
+KEYEVENTF_KEYUP = 0x0002
 WM_HOTKEY = 0x0312
 PM_REMOVE = 0x0001
 
@@ -222,8 +245,17 @@ class MOUSEINPUT(ctypes.Structure):
         ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
     ]
 
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.wintypes.WORD),
+        ("wScan", ctypes.wintypes.WORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("time", ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
 class _INPUT_UNION(ctypes.Union):
-    _fields_ = [("mi", MOUSEINPUT)]
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT)]
 
 class INPUT(ctypes.Structure):
     _fields_ = [
@@ -265,6 +297,19 @@ def _send_mouse_input(flags, dx=0, dy=0, data=0):
     inp.union.mi.time = 0
     inp.union.mi.dwExtraInfo = ctypes.pointer(ctypes.c_ulong(0))
     SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+def _send_key_event_vk(vk, key_down):
+    """用 SendInput 发送单个虚拟键的按下或抬起事件。"""
+    if not vk:
+        return False
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+    inp.union.ki.wVk = int(vk)
+    inp.union.ki.wScan = 0
+    inp.union.ki.dwFlags = 0 if key_down else KEYEVENTF_KEYUP
+    inp.union.ki.time = 0
+    inp.union.ki.dwExtraInfo = ctypes.pointer(ctypes.c_ulong(0))
+    return bool(SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)))
 
 def _bezier_curve(p0, p1, p2, p3, steps):
     points = []
@@ -347,6 +392,16 @@ CONFIG_PATH = choose_config_path()
 
 # 数字识别模板与配置放在同一目录，保证换电脑时模板跟着数据一起迁移
 set_template_dir(os.path.join(os.path.dirname(CONFIG_PATH), "count_templates"))
+rapidocr_params = {
+    "Global.use_det": False,
+    "Global.use_cls": False,
+    "Global.use_rec": True,
+    "Global.log_level": "warning",
+}
+rapidocr_models = os.path.join(APP_DIR, "models", "rapidocr")
+if os.path.isdir(rapidocr_models):
+    rapidocr_params["Global.model_root_dir"] = rapidocr_models
+set_rapidocr_params(rapidocr_params)
 
 
 # ── 配置读写（原子写入 + 自动备份，防止意外断电写坏数据） ──────────────────
@@ -369,7 +424,7 @@ def load_config(path):
         if not os.path.exists(candidate):
             continue
         try:
-            with open(candidate, "r", encoding="utf-8") as fh:
+            with open(candidate, "r", encoding="utf-8-sig") as fh:
                 return normalize_config(json.load(fh))
         except Exception:
             continue
@@ -448,6 +503,26 @@ def normalize_region_map(raw, stars=5):
     return result
 
 
+def normalize_vision_counters(raw):
+    """把左、中、右三块监控配置统一成内部结构。"""
+    raw = raw if isinstance(raw, dict) else {}
+    result = {}
+    for counter_id, default in DEFAULT_VISION_COUNTERS.items():
+        value = raw.get(counter_id, default)
+        if not isinstance(value, dict):
+            value = {}
+        region = parse_region(value.get("region"), default["region"])
+        result[counter_id] = {
+            "id": counter_id,
+            "name": str(value.get("name", default["name"])),
+            "region": list(region),
+            "threshold": max(0, int(safe_seconds(value.get("threshold", default["threshold"]), 0, 0, 999999))),
+            "enabled": bool(value.get("enabled", default["enabled"])),
+            "primary": bool(value.get("primary", default["primary"])),
+        }
+    return result
+
+
 def normalize_profile(raw):
     raw = raw if isinstance(raw, dict) else {}
     star_points = {}
@@ -460,6 +535,18 @@ def normalize_profile(raw):
         boss_card_point = normalize_point(raw_star_points.get(str(selected_star)))
     raw_ocr_regions = raw.get("count_ocr_regions") if isinstance(raw.get("count_ocr_regions"), dict) else {}
     execution_mode = "count" if str(raw.get("execution_mode", "") or "").lower() in ("count", "boss_count") else "free"
+    vision_counters = normalize_vision_counters(raw.get("vision_counters"))
+    vision_backend = str(raw.get("vision_backend", DEFAULT_VISION_BACKEND) or DEFAULT_VISION_BACKEND)
+    if vision_backend not in ("template_winocr", "template_winocr_rapidocr", "winocr_template"):
+        vision_backend = DEFAULT_VISION_BACKEND
+    pending_policy = str(raw.get("pending_policy", DEFAULT_PENDING_POLICY) or DEFAULT_PENDING_POLICY)
+    if pending_policy != DEFAULT_PENDING_POLICY:
+        pending_policy = DEFAULT_PENDING_POLICY
+    pending_before = raw.get("pending_before")
+    try:
+        pending_before = max(0, int(float(pending_before))) if pending_before is not None else None
+    except (TypeError, ValueError):
+        pending_before = None
     profile = {
         "hotkey": normalize_key_name(raw.get("hotkey") or raw.get("hotkey_vk")) or DEFAULT_HOTKEY,
         "right_hotkey": (normalize_key_name(raw.get("right_hotkey")
@@ -484,6 +571,17 @@ def normalize_profile(raw):
         "count_post_click_wait": safe_seconds(raw.get("count_post_click_wait"), DEFAULT_COUNT_POST_CLICK_WAIT, 0.05, MAX_INTERVAL),
         "count_next_cycle_wait": safe_seconds(raw.get("count_next_cycle_wait"), DEFAULT_COUNT_NEXT_CYCLE_WAIT, 0.05, MAX_INTERVAL),
         "count_auto_next": bool(raw.get("count_auto_next", DEFAULT_COUNT_AUTO_NEXT)),
+        "vision_counters": vision_counters,
+        "vision_stop_mode": str(raw.get("vision_stop_mode", DEFAULT_VISION_STOP_MODE) or DEFAULT_VISION_STOP_MODE),
+        "vision_stable_samples": max(2, min(10, int(safe_seconds(raw.get("vision_stable_samples", DEFAULT_VISION_STABLE_SAMPLES), DEFAULT_VISION_STABLE_SAMPLES, 2, 10)))),
+        "vision_poll_interval": safe_seconds(raw.get("vision_poll_interval"), DEFAULT_VISION_POLL_INTERVAL, 0.05, 2.0),
+        "vision_backend": vision_backend,
+        "vision_deadline_ms": max(100, min(1000, int(safe_seconds(raw.get("vision_deadline_ms", DEFAULT_VISION_DEADLINE_MS), DEFAULT_VISION_DEADLINE_MS, 100, 1000)))),
+        "confirm_reads": max(2, min(4, int(safe_seconds(raw.get("confirm_reads", DEFAULT_CONFIRM_READS), DEFAULT_CONFIRM_READS, 2, 4)))),
+        "pending_policy": pending_policy,
+        "pending_action_id": str(raw.get("pending_action_id", "") or "") or None,
+        "pending_before": pending_before,
+        "pending_started_at": str(raw.get("pending_started_at", "") or "") or None,
         "count_progress": max(0, int(safe_seconds(raw.get("count_progress", 0), 0, 0, 999999))),
         "items": [],
     }
@@ -514,6 +612,19 @@ def normalize_config(raw):
         "current_profile": "默认方案",
         "profiles": {"默认方案": normalize_profile(legacy)},
     }
+
+
+def recover_pending_profile(raw):
+    """启动时恢复未确认动作，返回 (规范化方案, 是否恢复)。"""
+    profile = normalize_profile(raw)
+    if not (profile.get("pending_action_id") and
+            profile.get("pending_policy") == DEFAULT_PENDING_POLICY):
+        return profile, False
+    profile["count_progress"] = min(profile["count_target"], profile["count_progress"] + 1)
+    profile["pending_action_id"] = None
+    profile["pending_before"] = None
+    profile["pending_started_at"] = None
+    return profile, True
 
 
 # ── 间隔解析与格式化 ────────────────────────────────────────────────────────
@@ -733,13 +844,14 @@ def mouse_right_up():
 
 
 def key_tap(name):
-    """按下并松开一个键，返回是否成功。"""
-    if not HAS_KEYBOARD or not name:
+    """用 Win32 SendInput 按下并松开一个键，返回是否成功。"""
+    vk = key_name_to_vk(name)
+    if not vk:
         return False
     try:
-        keyboard.press(name)
+        _send_key_event_vk(vk, True)
         time.sleep(random.uniform(0.03, 0.06))
-        keyboard.release(name)
+        _send_key_event_vk(vk, False)
         return True
     except Exception:
         return False
@@ -802,6 +914,18 @@ class AutoClicker:
         self.count_next_cycle_wait = DEFAULT_COUNT_NEXT_CYCLE_WAIT
         self.count_auto_next = DEFAULT_COUNT_AUTO_NEXT
         self.count_progress = 0
+        self.vision_counters = normalize_vision_counters({})
+        self.vision_stop_mode = DEFAULT_VISION_STOP_MODE
+        self.vision_stable_samples = DEFAULT_VISION_STABLE_SAMPLES
+        self.vision_poll_interval = DEFAULT_VISION_POLL_INTERVAL
+        self.vision_backend = DEFAULT_VISION_BACKEND
+        self.vision_deadline_ms = DEFAULT_VISION_DEADLINE_MS
+        self.confirm_reads = DEFAULT_CONFIRM_READS
+        self.pending_policy = DEFAULT_PENDING_POLICY
+        self.pending_action_id = None
+        self.pending_before = None
+        self.pending_started_at = None
+        self._config_lock = threading.RLock()
         self._save_job = None
         self._key_target = None
 
@@ -815,7 +939,7 @@ class AutoClicker:
         self.ui_queue = queue.Queue()
         self._hotkey_poll_stop = threading.Event()
         self._hotkey_poll_state = {"hotkey": False, "right_hotkey": False}
-        self._last_hotkey_trigger = 0.0
+        self._last_hotkey_trigger = {"hotkey": 0.0, "right_hotkey": 0.0}
         self._win_hotkey_stop = threading.Event()
         self._win_hotkey_thread = None
 
@@ -908,10 +1032,14 @@ class AutoClicker:
         list_bar = ttk.LabelFrame(self.root, text="执行列表")
         list_bar.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         columns = ("index", "type", "name", "detail", "interval")
-        self.tree = ttk.Treeview(list_bar, columns=columns, show="headings", height=8)
-        for key, title, width in (("index", "序号", 50), ("type", "类型", 70),
-                                  ("name", "名称", 130), ("detail", "内容", 200),
-                                  ("interval", "间隔", 120)):
+        tree_style = ttk.Style(self.root)
+        tree_style.configure("Compact.Treeview", font=("Segoe UI", 9), rowheight=22)
+        tree_style.configure("Compact.Treeview.Heading", font=("Segoe UI", 9))
+        self.tree = ttk.Treeview(list_bar, columns=columns, show="headings", height=8,
+                                 style="Compact.Treeview")
+        for key, title, width in (("index", "序号", 42), ("type", "类型", 55),
+                                  ("name", "名称", 110), ("detail", "内容", 180),
+                                  ("interval", "间隔", 90)):
             self.tree.heading(key, text=title)
             self.tree.column(key, width=width, anchor=tk.CENTER)
         scroll = ttk.Scrollbar(list_bar, orient=tk.VERTICAL, command=self.tree.yview)
@@ -1000,6 +1128,49 @@ class AutoClicker:
         ttk.Button(count_ocr, text="重置进度", width=9,
                    command=self._reset_count_progress).pack(side=tk.LEFT, padx=3)
 
+        vision_frame = ttk.LabelFrame(count_frame, text="三区域阈值监控（严格减 1）")
+        vision_frame.pack(fill=tk.X, padx=8, pady=4)
+        self.vision_vars = {}
+        for counter_id, counter in self.vision_counters.items():
+            row = ttk.Frame(vision_frame)
+            row.pack(fill=tk.X, padx=4, pady=2)
+            enabled_var = tk.BooleanVar(value=counter["enabled"])
+            region_var = tk.StringVar(value=",".join(str(item) for item in counter["region"]))
+            threshold_var = tk.StringVar(value=str(counter["threshold"]))
+            self.vision_vars[counter_id] = {
+                "enabled": enabled_var,
+                "region": region_var,
+                "threshold": threshold_var,
+            }
+            ttk.Checkbutton(row, text=counter["name"], variable=enabled_var,
+                            command=self._on_change).pack(side=tk.LEFT)
+            ttk.Entry(row, textvariable=region_var, width=18).pack(side=tk.LEFT, padx=4)
+            ttk.Label(row, text="阈值").pack(side=tk.LEFT)
+            ttk.Entry(row, textvariable=threshold_var, width=7).pack(side=tk.LEFT, padx=4)
+            ttk.Button(row, text="采集", width=6,
+                       command=lambda cid=counter_id: self._capture_vision_region(cid)).pack(side=tk.LEFT, padx=2)
+            ttk.Button(row, text="测试", width=6,
+                       command=lambda cid=counter_id: self._test_vision_ocr(cid)).pack(side=tk.LEFT, padx=2)
+            ttk.Button(row, text="学习", width=6,
+                       command=lambda cid=counter_id: self._learn_vision_templates(cid)).pack(side=tk.LEFT, padx=2)
+            ttk.Button(row, text="人工录入", width=8,
+                       command=lambda cid=counter_id: self._manual_calibrate_vision(cid)).pack(side=tk.LEFT, padx=2)
+        vision_controls = ttk.Frame(vision_frame)
+        vision_controls.pack(fill=tk.X, padx=4, pady=(2, 4))
+        ttk.Label(vision_controls, text="停止条件").pack(side=tk.LEFT)
+        self.vision_stop_mode_var = tk.StringVar(value=self.vision_stop_mode)
+        self.vision_stop_mode_box = ttk.Combobox(
+            vision_controls, textvariable=self.vision_stop_mode_var, state="readonly", width=14,
+            values=("left", "any", "all", "left_and_any", "left_and_all", "pair"))
+        self.vision_stop_mode_box.pack(side=tk.LEFT, padx=4)
+        self.vision_stop_mode_box.bind("<<ComboboxSelected>>", lambda _event: self._on_change())
+        ttk.Label(vision_controls, text="轮询秒").pack(side=tk.LEFT, padx=(8, 2))
+        self.vision_poll_var = tk.StringVar(value=str(self.vision_poll_interval))
+        ttk.Entry(vision_controls, textvariable=self.vision_poll_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(vision_controls, text="稳定次数").pack(side=tk.LEFT, padx=(8, 2))
+        self.vision_stable_var = tk.StringVar(value=str(self.vision_stable_samples))
+        ttk.Entry(vision_controls, textvariable=self.vision_stable_var, width=5).pack(side=tk.LEFT)
+
         count_options = ttk.Frame(count_frame)
         count_options.pack(fill=tk.X, padx=8, pady=(2, 5))
         self.count_auto_next_var = tk.BooleanVar(value=True)
@@ -1057,9 +1228,6 @@ class AutoClicker:
         ttk.Label(foot, text=data_text, foreground="#666").pack(side=tk.LEFT)
         if not is_admin():
             ttk.Button(foot, text="以管理员身份重启", command=self._restart_as_admin).pack(side=tk.RIGHT)
-        if not HAS_KEYBOARD:
-            ttk.Label(foot, text="未安装 keyboard 库，键盘功能不可用",
-                      foreground="#c00").pack(side=tk.RIGHT, padx=8)
 
     # ── 方案管理 ────────────────────────────────────────────────────────────
     def _collect_profile(self):
@@ -1069,6 +1237,7 @@ class AutoClicker:
         except (TypeError, ValueError):
             count_target = DEFAULT_COUNT_TARGET
         count_open_key = self.count_open_key_holder.get("name") or DEFAULT_COUNT_OPEN_KEY
+        vision_counters = self._current_vision_counters()
         return {
             "hotkey": self.hotkey,
             "right_hotkey": self.right_hotkey,
@@ -1096,12 +1265,33 @@ class AutoClicker:
             "count_post_click_wait": self._safe_float(self.count_post_click_wait_var.get(), DEFAULT_COUNT_POST_CLICK_WAIT),
             "count_next_cycle_wait": self._safe_float(self.count_next_cycle_wait_var.get(), DEFAULT_COUNT_NEXT_CYCLE_WAIT),
             "count_auto_next": bool(self.count_auto_next_var.get()),
+            "vision_counters": {key: dict(value) for key, value in vision_counters.items()},
+            "vision_stop_mode": self.vision_stop_mode_var.get(),
+            "vision_stable_samples": max(2, min(10, int(self._safe_float(self.vision_stable_var.get(), self.vision_stable_samples)))),
+            "vision_poll_interval": self._safe_float(self.vision_poll_var.get(), self.vision_poll_interval),
+            "vision_backend": self.vision_backend,
+            "vision_deadline_ms": max(100, min(1000, int(self.vision_deadline_ms))),
+            "confirm_reads": max(2, min(4, int(self.confirm_reads))),
+            "pending_policy": self.pending_policy,
+            "pending_action_id": self.pending_action_id,
+            "pending_before": self.pending_before,
+            "pending_started_at": self.pending_started_at,
             "count_progress": max(0, int(self.count_progress)),
             "items": [dict(item) for item in self.items],
         }
 
     def _load_profile(self, name):
-        profile = normalize_profile(self.profiles.get(name))
+        original_profile = self.profiles.get(name, {})
+        previous_profile = normalize_profile(original_profile)
+        profile, recovered_pending = recover_pending_profile(original_profile)
+        if recovered_pending:
+            # 上次在点击后中断时按已消耗一次结算，随后清除标记，避免重启重复点击。
+            old_progress = profile["count_progress"]
+            self._log_debug(
+                "恢复 pending：action_id=%s before=%s progress=%s→%s，按已消耗 1 次结算" %
+                (original_profile.get("pending_action_id"),
+                 original_profile.get("pending_before"),
+                 previous_profile["count_progress"], old_progress))
         self.profiles[name] = profile
         self.current_profile = name
         self.items = [dict(item) for item in profile["items"]]
@@ -1138,6 +1328,25 @@ class AutoClicker:
         self.count_next_cycle_wait = profile["count_next_cycle_wait"]
         self.count_auto_next = profile["count_auto_next"]
         self.count_progress = profile["count_progress"]
+        self.vision_counters = normalize_vision_counters(profile.get("vision_counters"))
+        self.vision_stop_mode = profile["vision_stop_mode"]
+        self.vision_stable_samples = profile["vision_stable_samples"]
+        self.vision_poll_interval = profile["vision_poll_interval"]
+        self.vision_backend = profile["vision_backend"]
+        self.vision_deadline_ms = profile["vision_deadline_ms"]
+        self.confirm_reads = profile["confirm_reads"]
+        self.pending_policy = profile["pending_policy"]
+        self.pending_action_id = profile["pending_action_id"]
+        self.pending_before = profile["pending_before"]
+        self.pending_started_at = profile["pending_started_at"]
+        self.vision_stop_mode_var.set(self.vision_stop_mode)
+        self.vision_stable_var.set(str(self.vision_stable_samples))
+        self.vision_poll_var.set(str(self.vision_poll_interval))
+        for counter_id, counter in self.vision_counters.items():
+            if counter_id in self.vision_vars:
+                self.vision_vars[counter_id]["enabled"].set(counter["enabled"])
+                self.vision_vars[counter_id]["region"].set(",".join(str(item) for item in counter["region"]))
+                self.vision_vars[counter_id]["threshold"].set(str(counter["threshold"]))
         self.count_post_click_wait_var.set(f"{self.count_post_click_wait:g}")
         self.count_next_cycle_wait_var.set(f"{self.count_next_cycle_wait:g}")
         self.count_auto_next_var.set(self.count_auto_next)
@@ -1148,7 +1357,7 @@ class AutoClicker:
         self._refresh_profile_list()
         self._refresh_list()
         self._register_hotkey()
-        self.status_var.set(f"当前方案：{name}")
+        self.status_var.set("当前方案：%s%s" % (name, "（已恢复未确认动作）" if recovered_pending else ""))
 
     def _refresh_profile_list(self):
         names = list(self.profiles.keys())
@@ -1295,15 +1504,55 @@ class AutoClicker:
     def _save_now(self):
         self._save_job = None
         try:
-            self.profiles[self.current_profile] = self._collect_profile()
-            self.cfg = {"version": 2, "current_profile": self.current_profile,
-                        "profiles": self.profiles}
-            save_config(CONFIG_PATH, self.cfg)
+            with getattr(self, "_config_lock", threading.RLock()):
+                self.profiles[self.current_profile] = self._collect_profile()
+                self.cfg = {"version": 2, "current_profile": self.current_profile,
+                            "profiles": self.profiles}
+                save_config(CONFIG_PATH, self.cfg)
         except Exception as exc:
             try:
                 self.status_var.set(f"保存失败：{exc}")
             except Exception:
                 pass
+
+    def _save_count_state(self):
+        """在执行线程中原子保存进度和 pending，避免依赖 Tk 控件。"""
+        try:
+            with getattr(self, "_config_lock", threading.RLock()):
+                profile = dict(self.profiles.get(self.current_profile, {}))
+                profile.update({
+                    "count_progress": max(0, int(self.count_progress)),
+                    "pending_policy": self.pending_policy,
+                    "pending_action_id": self.pending_action_id,
+                    "pending_before": self.pending_before,
+                    "pending_started_at": self.pending_started_at,
+                    "vision_backend": self.vision_backend,
+                    "vision_deadline_ms": self.vision_deadline_ms,
+                    "confirm_reads": self.confirm_reads,
+                })
+                self.profiles[self.current_profile] = normalize_profile(profile)
+                self.cfg = {"version": 2, "current_profile": self.current_profile,
+                            "profiles": self.profiles}
+                save_config(CONFIG_PATH, self.cfg)
+        except Exception as exc:
+            self._log_debug("计数状态保存失败：%s" % exc)
+
+    def _mark_pending(self, before):
+        """点击前落盘待确认动作，进程中断时由启动恢复逻辑结算。"""
+        self.pending_action_id = uuid.uuid4().hex
+        self.pending_before = int(before)
+        self.pending_started_at = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        self._save_count_state()
+        self._log_debug("写入 pending：action_id=%s before=%s" %
+                        (self.pending_action_id, self.pending_before))
+
+    def _clear_pending(self):
+        action_id = self.pending_action_id
+        self.pending_action_id = None
+        self.pending_before = None
+        self.pending_started_at = None
+        self._save_count_state()
+        self._log_debug("清除 pending：action_id=%s" % action_id)
 
     def _sync_jitter(self):
         self.jitter_on = bool(self.jitter_on_var.get())
@@ -1634,6 +1883,86 @@ class AutoClicker:
         self.count_ocr_region = list(region)
         return region
 
+    def _vision_counter_from_vars(self, counter_id):
+        vars_for_counter = self.vision_vars.get(counter_id)
+        counter = self.vision_counters.get(counter_id, DEFAULT_VISION_COUNTERS[counter_id])
+        if vars_for_counter is None:
+            return dict(counter)
+        return {
+            "id": counter_id,
+            "name": counter["name"],
+            "region": list(parse_region(vars_for_counter["region"].get(), counter["region"])),
+            "threshold": max(0, int(self._safe_float(vars_for_counter["threshold"].get(), counter["threshold"]))),
+            "enabled": bool(vars_for_counter["enabled"].get()),
+            "primary": counter["primary"],
+        }
+
+    def _current_vision_counters(self):
+        for counter_id in self.vision_counters:
+            self.vision_counters[counter_id] = self._vision_counter_from_vars(counter_id)
+        return self.vision_counters
+
+    def _capture_vision_region(self, counter_id):
+        def done(x_value, y_value):
+            width, height = 120, 36
+            region = [max(0, int(x_value - width // 2)), max(0, int(y_value - height // 2)), width, height]
+            self.vision_vars[counter_id]["region"].set(",".join(str(item) for item in region))
+            self._current_vision_counters()
+            self._on_change()
+            self.status_var.set(f"已采集 {counter_id} 数量区域 {','.join(str(item) for item in region)}")
+
+        self._countdown_window(f"请把鼠标移到 {counter_id} 数字右下角，倒计时结束后自动记录", done)
+
+    def _test_vision_ocr(self, counter_id):
+        counter = self._vision_counter_from_vars(counter_id)
+        if not counter["enabled"]:
+            return
+        self.status_var.set(f"正在测试 {counter_id} 数量区域……")
+        set_template_namespace(counter_id)
+        value, elapsed, layer = read_count_fast(counter["region"])
+        if value is None:
+            self.count_ocr_status_var.set(f"{counter_id} OCR：读取失败")
+            self.status_var.set(f"{counter_id} 测试读取失败")
+        else:
+            self.count_ocr_status_var.set(f"{counter_id} OCR：{value}（{layer}，{elapsed:.0f}ms）")
+            self.status_var.set(f"{counter_id} 测试读取：{value}")
+
+    def _learn_vision_templates(self, counter_id):
+        counter = self._vision_counter_from_vars(counter_id)
+        if not counter["enabled"]:
+            return
+        set_template_namespace(counter_id)
+        self.status_var.set(f"正在学习 {counter_id} 数字模板……")
+        learned = learn_templates(counter["region"], frames=5, delay=0.2, namespace=counter_id)
+        covered = sum(1 for count in learned.values() if count > 0)
+        self.status_var.set(f"{counter_id} 学习完成：新增 {sum(learned.values())} 张，覆盖 {covered}/10")
+        self.count_ocr_status_var.set(f"{counter_id} 模板：覆盖 {covered}/10")
+
+    def _manual_calibrate_vision(self, counter_id):
+        counter = self._vision_counter_from_vars(counter_id)
+        if not counter["enabled"]:
+            return
+        set_template_namespace(counter_id)
+        image = capture_region(counter["region"])
+        if image is None:
+            messagebox.showwarning(APP_NAME, "截屏失败，无法人工录入。", parent=self.root)
+            return
+        boxes = _segment_digit_boxes(image)
+        if not boxes:
+            messagebox.showwarning(APP_NAME, "没有分割到数字，请重新采集区域。", parent=self.root)
+            return
+        value = simpledialog.askstring(
+            APP_NAME, f"请填写当前 {counter['name']} 数字（已分割 {len(boxes)} 位）", parent=self.root)
+        digits = [char for char in (value or "") if char.isdigit()]
+        if len(digits) != len(boxes):
+            messagebox.showwarning(APP_NAME, "输入位数与分割结果不一致，未保存。", parent=self.root)
+            return
+        saved = 0
+        for digit, box in zip(digits, boxes):
+            if save_template(image, box, int(digit)):
+                saved += 1
+        self.status_var.set(f"{counter_id} 人工录入完成：保存 {saved} 张模板")
+
     def _test_count_ocr(self):
         region = self._current_count_region()
         status = engine_status()
@@ -1641,11 +1970,9 @@ class AutoClicker:
             missing = []
             if not HAS_PIL_OCR:
                 missing.append("Pillow")
-            if not status["winrt"]:
+            if not status["rapidocr"] and not status["winrt"]:
                 missing.append("Windows OCR")
-            if not HAS_PYTesseract_OCR:
-                missing.append("pytesseract")
-            if not status["tesseract"]:
+            if not status["rapidocr"] and not status["winrt"] and not status["tesseract"]:
                 missing.append("Tesseract 语言包")
             self.count_ocr_status_var.set("OCR：" + ("、".join(missing) + " 缺失" if missing else "不可用"))
             messagebox.showwarning(
@@ -1654,10 +1981,11 @@ class AutoClicker:
                 parent=self.root)
             return
         self.count_ocr_status_var.set("OCR：识别中……")
-        self.status_var.set("正在三层识别 Boss 卡数量……")
+        self.status_var.set("正在多层识别 Boss 卡数量……")
         info = read_count_debug(region, command=status["tesseract_path"], tessdata_dir=status["tessdata"])
         parts = [
             f"模板：{info['template_value']}（{info['template_ms']:.0f}ms）",
+            f"RapidOCR：{info['rapidocr_value']}（{info['rapidocr_ms']:.0f}ms）",
             f"WinOCR：{info['winocr_value']}（{info['winocr_ms']:.0f}ms）",
             f"Tesseract：{info['tesseract_value']}（{info['tesseract_ms']:.0f}ms）",
         ]
@@ -1666,7 +1994,7 @@ class AutoClicker:
             self.status_var.set("识别成功：" + "，".join(parts) + f"，总耗时 {info['total_ms']:.0f}ms")
         else:
             self.count_ocr_status_var.set("OCR：读取失败")
-            self.status_var.set("三层识别均失败：" + "，".join(parts) + "（可点「学习数字」后再试）")
+            self.status_var.set("多层识别均失败：" + "，".join(parts) + "（可点「学习数字」或「人工录入」后再试）")
 
     def _learn_count_templates(self):
         """打开召唤界面后点击：采集约 5 帧，自动学习 0-9 数字模板（后台执行）。"""
@@ -1710,7 +2038,11 @@ class AutoClicker:
 
     def _reset_count_progress(self):
         self.count_progress = 0
+        self.pending_action_id = None
+        self.pending_before = None
+        self.pending_started_at = None
         self.count_progress_var.set("进度 0 / " + str(self.count_target))
+        self._save_count_state()
         self._on_change()
         self.status_var.set("Boss 卡计数进度已重置")
 
@@ -1775,9 +2107,6 @@ class AutoClicker:
         self._start_key_capture("right_hotkey", "请按下要作为「按住右键」热键的按键…")
 
     def _start_key_capture(self, target, prompt="请按下要绑定的按键…"):
-        if not HAS_KEYBOARD:
-            messagebox.showwarning(APP_NAME, "当前环境没有 keyboard 库，无法采集按键。", parent=self.root)
-            return
         if self.capturing:
             return
         self.capturing = True
@@ -1813,6 +2142,7 @@ class AutoClicker:
 
     def _handle_key_captured(self, name, target):
         self.capturing = False
+        self._hotkey_poll_state = {"hotkey": False, "right_hotkey": False}
         self._register_hotkey()
         if not name:
             self.status_var.set("按键采集超时，请重新点击设置")
@@ -1877,47 +2207,26 @@ class AutoClicker:
     # ── 全局热键 ────────────────────────────────────────────────────────────
     def _register_hotkey(self):
         self._unregister_hotkey()
-        self._restart_win_hotkey_worker()
-        if not HAS_KEYBOARD:
-            return
-        if self.hotkey:
-            try:
-                self.hotkey_handle = keyboard.add_hotkey(self.hotkey, self._on_hotkey, suppress=False)
-            except Exception as exc:
-                self.hotkey_handle = None
-                self.status_var.set(f"热键 {key_display(self.hotkey)} 注册失败：{exc}")
-        # 按住右键的独立热键；与启停热键相同时跳过，避免同一个键被注册两次
-        if self.right_hotkey and self.right_hotkey != self.hotkey:
-            try:
-                self.right_hotkey_handle = keyboard.add_hotkey(self.right_hotkey,
-                                                               self._on_right_hotkey, suppress=False)
-            except Exception as exc:
-                self.right_hotkey_handle = None
-                self.status_var.set(f"热键 {key_display(self.right_hotkey)} 注册失败：{exc}")
+        if self.hotkey and not key_name_to_vk(self.hotkey):
+            self.status_var.set(f"热键 {key_display(self.hotkey)} 无法转换为 Windows 键码")
+        if self.right_hotkey and self.right_hotkey != self.hotkey and not key_name_to_vk(self.right_hotkey):
+            self.status_var.set(f"热键 {key_display(self.right_hotkey)} 无法转换为 Windows 键码")
+        self._win_hotkey_stop = threading.Event()
+        self._win_hotkey_thread = threading.Thread(
+            target=self._win_hotkey_worker, args=(self._win_hotkey_stop,), daemon=True)
+        self._win_hotkey_thread.start()
 
 
     def _unregister_hotkey(self):
-        if keyboard is not None:
-            for handle in (self.hotkey_handle, self.right_hotkey_handle):
-                if handle is not None:
-                    try:
-                        keyboard.remove_hotkey(handle)
-                    except Exception:
-                        pass
+        self._win_hotkey_stop.set()
+        worker = self._win_hotkey_thread
+        if worker and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=0.5)
+        self._win_hotkey_thread = None
         self.hotkey_handle = None
         self.right_hotkey_handle = None
 
-    def _restart_win_hotkey_worker(self):
-        """重启系统级 RegisterHotKey 后备线程，保证修改热键后立即生效。"""
-        self._win_hotkey_stop.set()
-        worker = self._win_hotkey_thread
-        if worker and worker.is_alive():
-            worker.join(timeout=0.3)
-        self._win_hotkey_stop = threading.Event()
-        self._win_hotkey_thread = threading.Thread(target=self._win_hotkey_worker, daemon=True)
-        self._win_hotkey_thread.start()
-
-    def _win_hotkey_worker(self):
+    def _win_hotkey_worker(self, stop_event):
         """使用 Windows RegisterHotKey 提供最后一层全局热键后备。"""
         create = user32.CreateWindowExW
         create.argtypes = [
@@ -1950,7 +2259,7 @@ class AutoClicker:
                 if vk and register(hwnd, identifier, 0, vk):
                     registered[identifier] = target
             message = MSG()
-            while not self._win_hotkey_stop.is_set():
+            while not stop_event.is_set():
                 if peek(ctypes.byref(message), hwnd, WM_HOTKEY, WM_HOTKEY, PM_REMOVE):
                     target = registered.get(int(message.wParam))
                     if target == "hotkey":
@@ -1965,17 +2274,21 @@ class AutoClicker:
             destroy(hwnd)
 
     def _on_hotkey(self):
-        now = time.time()
-        if now - self._last_hotkey_trigger < 0.2:
+        if self.capturing:
             return
-        self._last_hotkey_trigger = now
+        now = time.monotonic()
+        if now - self._last_hotkey_trigger["hotkey"] < 0.2:
+            return
+        self._last_hotkey_trigger["hotkey"] = now
         self.ui_queue.put(("toggle", None))
 
     def _on_right_hotkey(self):
-        now = time.time()
-        if now - self._last_hotkey_trigger < 0.2:
+        if self.capturing:
             return
-        self._last_hotkey_trigger = now
+        now = time.monotonic()
+        if now - self._last_hotkey_trigger["right_hotkey"] < 0.2:
+            return
+        self._last_hotkey_trigger["right_hotkey"] = now
         self.ui_queue.put(("right_toggle", None))
 
     def _hotkey_poll_loop(self):
@@ -1998,7 +2311,7 @@ class AutoClicker:
     def _log_error(self, message):
         """把异常写入 debug.log 并显示在状态栏，保证冻结 exe 里错误可见。"""
         try:
-            with open(os.path.join(APP_DIR, "debug.log"), "a", encoding="utf-8") as fh:
+            with open(os.path.join(os.path.dirname(CONFIG_PATH), "debug.log"), "a", encoding="utf-8") as fh:
                 fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
                 fh.write(traceback.format_exc() + "\n")
         except Exception:
@@ -2011,7 +2324,7 @@ class AutoClicker:
     def _log_debug(self, message):
         """把运行细节写入 debug.log，便于排查计数核对等非异常问题。"""
         try:
-            with open(os.path.join(APP_DIR, "debug.log"), "a", encoding="utf-8") as fh:
+            with open(os.path.join(os.path.dirname(CONFIG_PATH), "debug.log"), "a", encoding="utf-8") as fh:
                 fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), message))
         except Exception:
             pass
@@ -2043,7 +2356,7 @@ class AutoClicker:
             self.btn_stop.config(state=tk.DISABLED)
             if self.right_held and self.right_held_auto:
                 self._release_right()
-            self.status_var.set("已停止")
+            self.status_var.set(message[1] or "已停止")
         elif kind == "count_progress":
             self.count_progress = max(0, int(message[1]))
             self.count_progress_var.set(f"进度 {self.count_progress} / {self.count_target}")
@@ -2082,31 +2395,41 @@ class AutoClicker:
     def _start_clicking_impl(self):
         self._sync_count_values()
         if self.execution_mode_var.get() == "Boss 卡计数":
+            vision_enabled = any(counter.get("enabled") for counter in self.vision_counters.values())
             if not ocr_available():
                 messagebox.showwarning(
                     APP_NAME,
-                    "Boss 卡计数模式需要 OCR 组件（Pillow + Windows OCR 或 Tesseract）。\n"
+                    "Boss 卡计数模式需要 OCR 组件（Pillow + RapidOCR / Windows OCR / Tesseract）。\n"
                     "当前 OCR 不可用；自由循环模式仍可使用。",
                     parent=self.root)
                 return
-            if not HAS_KEYBOARD:
-                messagebox.showwarning(APP_NAME, "Boss 卡计数模式需要 keyboard 库来按唤出键。", parent=self.root)
-                return
-            summon = self.count_summon_point
-            boss_card = self.count_boss_card_point
-            region = parse_region(self.count_ocr_region, DEFAULT_COUNT_REGION)
-            if summon.get("x", 0) == 0 and summon.get("y", 0) == 0:
-                messagebox.showwarning(APP_NAME, "请先采集召唤按钮坐标。", parent=self.root)
-                return
-            if boss_card.get("x", 0) == 0 and boss_card.get("y", 0) == 0:
-                messagebox.showwarning(APP_NAME, "请先采集 Boss 卡坐标。", parent=self.root)
-                return
-            if region[2] < 20 or region[3] < 8:
-                messagebox.showwarning(APP_NAME, "OCR 数量区域至少需要 20x8 像素，请重新采集。", parent=self.root)
-                return
-            if self.count_target <= 0:
-                messagebox.showwarning(APP_NAME, "目标次数必须大于 0。", parent=self.root)
-                return
+            if vision_enabled:
+                for counter in self.vision_counters.values():
+                    if not counter.get("enabled"):
+                        continue
+                    region = parse_region(counter["region"], DEFAULT_COUNT_REGION)
+                    if region[2] < 20 or region[3] < 8:
+                        messagebox.showwarning(
+                            APP_NAME,
+                            f"{counter['name']}数量区域至少需要 20x8 像素，请重新采集。",
+                            parent=self.root)
+                        return
+            else:
+                summon = self.count_summon_point
+                boss_card = self.count_boss_card_point
+                region = parse_region(self.count_ocr_region, DEFAULT_COUNT_REGION)
+                if summon.get("x", 0) == 0 and summon.get("y", 0) == 0:
+                    messagebox.showwarning(APP_NAME, "请先采集召唤按钮坐标。", parent=self.root)
+                    return
+                if boss_card.get("x", 0) == 0 and boss_card.get("y", 0) == 0:
+                    messagebox.showwarning(APP_NAME, "请先采集 Boss 卡坐标。", parent=self.root)
+                    return
+                if region[2] < 20 or region[3] < 8:
+                    messagebox.showwarning(APP_NAME, "OCR 数量区域至少需要 20x8 像素，请重新采集。", parent=self.root)
+                    return
+                if self.count_target <= 0:
+                    messagebox.showwarning(APP_NAME, "目标次数必须大于 0。", parent=self.root)
+                    return
         elif not self.items:
             messagebox.showwarning(APP_NAME, "列表为空，请先采集或手动添加。", parent=self.root)
             return
@@ -2137,25 +2460,29 @@ class AutoClicker:
 
     def _click_loop(self):
         """循环执行的入口：不管中间出什么意外，都要复位状态并通知界面。"""
+        stop_reason = None
         try:
             self._click_rounds()
         except Exception as exc:
-            self._set_status(f"执行出错：{exc}")
+            stop_reason = f"执行出错：{exc}（详见 debug.log）"
+            self._log_debug(traceback.format_exc())
         finally:
             self.running = False
-            self.ui_queue.put(("stopped", None))
+            self.ui_queue.put(("stopped", stop_reason))
 
     def _count_loop(self):
         """Boss 卡计数模式入口：OCR 不稳定或数量异常时立即停止。"""
+        stop_reason = None
         try:
             self._run_count_mode()
         except CountSafetyError as exc:
-            self._set_status(f"计数已停止：{exc}")
+            stop_reason = f"计数已停止：{exc}"
         except Exception as exc:
-            self._set_status(f"计数执行出错：{exc}")
+            stop_reason = f"计数执行出错：{exc}（详见 debug.log）"
+            self._log_debug(traceback.format_exc())
         finally:
             self.running = False
-            self.ui_queue.put(("stopped", None))
+            self.ui_queue.put(("stopped", stop_reason))
 
     def _sync_count_values(self):
         """把界面上的计数参数写入运行时变量，避免启动线程后读取到旧值。"""
@@ -2184,6 +2511,10 @@ class AutoClicker:
         self.count_next_cycle_wait = max(
             MIN_INTERVAL, min(MAX_INTERVAL, self._safe_float(self.count_next_cycle_wait_var.get(), DEFAULT_COUNT_NEXT_CYCLE_WAIT)))
         self.count_auto_next = bool(self.count_auto_next_var.get())
+        self.vision_counters = self._current_vision_counters()
+        self.vision_stop_mode = self.vision_stop_mode_var.get()
+        self.vision_stable_samples = max(2, min(10, int(self._safe_float(self.vision_stable_var.get(), self.vision_stable_samples))))
+        self.vision_poll_interval = max(0.05, min(2.0, self._safe_float(self.vision_poll_var.get(), self.vision_poll_interval)))
         self.count_progress_var.set(f"进度 {self.count_progress} / {self.count_target}")
 
     def _expand_region_to_screen(self, region, pad=12):
@@ -2202,17 +2533,40 @@ class AutoClicker:
         未检测到才按唤出键试探。Boss 存活期间界面打不开，按 E 无效；
         Boss 被击杀后下一次试探即可打开界面，快速衔接下一轮。返回识别到的数量。"""
         presses = 0
+        candidate = None
+        deadline = time.monotonic() + 300
         while self.running:
-            value, _used, _raw = read_count_quick(
-                region, attempts=1, command=command, tessdata_dir=tessdata_dir)
+            value, _elapsed, _layer = read_count_fast(
+                region, command=command, tessdata_dir=tessdata_dir,
+                budget_ms=getattr(self, "vision_deadline_ms", DEFAULT_VISION_DEADLINE_MS),
+                backend=getattr(self, "vision_backend", DEFAULT_VISION_BACKEND))
+            if value is None and presses and presses % 3 == 0:
+                value, _elapsed, _layer = read_count_fast(
+                    region, command=command, tessdata_dir=tessdata_dir,
+                    budget_ms=getattr(self, "vision_deadline_ms", DEFAULT_VISION_DEADLINE_MS),
+                    backend=getattr(self, "vision_backend", DEFAULT_VISION_BACKEND))
+                if value is not None and value > 0:
+                    confirmed, _elapsed, _layer = read_count_fast(
+                        region, command=command, tessdata_dir=tessdata_dir,
+                        budget_ms=getattr(self, "vision_deadline_ms", DEFAULT_VISION_DEADLINE_MS),
+                        backend=getattr(self, "vision_backend", DEFAULT_VISION_BACKEND))
+                    if confirmed == value:
+                        return value
             if value is not None and value > 0:
-                return value
+                if value == candidate:
+                    return value
+                candidate = value
+                self._sleep_interruptible(0.15)
+                continue
+            candidate = None
+            if time.monotonic() >= deadline:
+                raise CountSafetyError("等待召唤界面超过 5 分钟；请检查数量区域或 OCR 测试结果")
             presses += 1
             self._set_status(
                 f"召唤界面未出现（已试探 {presses} 次），按下 {key_display(self.count_open_key)} "
                 f"唤出；Boss 存活期间会自动持续等待，击杀后立即衔接……")
             if not key_tap(self.count_open_key):
-                self._log_debug("唤出键执行失败（keyboard 不可用），继续轮询")
+                self._log_debug("唤出键执行失败（Win32 SendInput），继续轮询")
             if presses % 10 == 0:
                 self._log_debug(
                     "召唤界面长时间未检测到：请确认数量区域坐标正确，或先点「学习数字」")
@@ -2224,11 +2578,52 @@ class AutoClicker:
                 self._sleep_interruptible(random.uniform(poll_base * 0.6, poll_base * 1.3))
         return None
 
+    def _run_vision_threshold_mode(self, counters):
+        """三区域严格减 1 监控，达到组合阈值时停止当前自动化。"""
+        command = resolve_tesseract()
+        tessdata_dir = resolve_tessdata(command)
+        self._set_status("正在预热视觉监控 OCR 引擎……")
+        warm_up_ocr(command=command, tessdata_dir=tessdata_dir)
+        monitor = MultiCounterMonitor(
+            counters,
+            stop_mode=self.vision_stop_mode,
+            stable_samples=self.vision_stable_samples,
+        )
+        while self.running and not monitor.triggered:
+            snapshot = {}
+            details = []
+            for counter in counters:
+                if not counter.get("enabled"):
+                    continue
+                set_template_namespace(counter["id"])
+                value, elapsed, layer = read_count_fast(
+                    counter["region"],
+                    command=command,
+                    tessdata_dir=tessdata_dir,
+                    budget_ms=getattr(self, "vision_deadline_ms", DEFAULT_VISION_DEADLINE_MS),
+                    backend=getattr(self, "vision_backend", DEFAULT_VISION_BACKEND),
+                )
+                snapshot[counter["id"]] = value
+                details.append(f"{counter['name']}={value if value is not None else '?'}")
+            triggered, events = monitor.observe(snapshot)
+            event_text = "，".join(f"{counter_id}:{event}" for counter_id, event in events.items() if event)
+            self._set_status(f"视觉监控：{'，'.join(details)} | {event_text}")
+            if triggered:
+                self._set_status(f"视觉阈值已达到：{self.vision_stop_mode}")
+                break
+            self._sleep_interruptible(self.vision_poll_interval)
+
     def _run_count_mode(self):
         """计数状态机：界面轮询 → 三层识别 → 拟人点击召唤 → 快速核对 →
         击杀 Boss 后自动衔接下一轮，持续到目标次数或停止。"""
         summon = self.count_summon_point
         boss_card = self.count_boss_card_point
+        enabled_vision_counters = [
+            dict(counter) for counter in self.vision_counters.values() if counter.get("enabled")
+        ]
+        if enabled_vision_counters:
+            self._run_vision_threshold_mode(enabled_vision_counters)
+            return
         region = self._expand_region_to_screen(self.count_ocr_region)
         guard = CountGuard(self.count_target, self.count_progress)
         command = resolve_tesseract()
@@ -2248,6 +2643,9 @@ class AutoClicker:
                 break
             self._set_status(f"识别到当前数量：{before}")
 
+            # 点击前先落盘待确认动作，意外中断时下次启动自动按已消耗一次结算。
+            self._mark_pending(before)
+
             # 拟人化点击：读取后随机停顿，贝塞尔曲线移动 + 轻微抖动
             self._sleep_interruptible(random.uniform(0.15, 0.4))
             mouse_click_left(int(boss_card["x"]), int(boss_card["y"]), jitter=True)
@@ -2255,30 +2653,46 @@ class AutoClicker:
             mouse_click_left(int(summon["x"]), int(summon["y"]), jitter=True)
             self._sleep_interruptible(self.count_post_click_wait)
 
-            # 召唤后快速核对：识别到下降立即确认；读不到最多约 2 秒后按消耗 1 张继续
+            # 召唤后快速核对：必须连续两次读到同一结果才提交进度。
             after = None
+            confirmed_after = None
             last_read = None
-            deadline = time.time() + verify_timeout
+            deadline = time.monotonic() + min(1.0, verify_timeout)
             attempt = 0
+            candidate_after = None
             while True:
                 attempt += 1
-                after, _used, _raw = read_count_quick(
-                    region, attempts=1, command=command, tessdata_dir=tessdata_dir)
+                after, _elapsed, _layer = read_count_fast(
+                    region, command=command, tessdata_dir=tessdata_dir,
+                    budget_ms=getattr(self, "vision_deadline_ms", DEFAULT_VISION_DEADLINE_MS),
+                    backend=getattr(self, "vision_backend", DEFAULT_VISION_BACKEND))
                 if after is not None:
                     last_read = after
                     self._set_status(f"核对第 {attempt} 次：读到 {after}（召唤前 {before}）")
-                    if after < before:
+                    if after == candidate_after:
+                        confirmed_after = after
                         break
+                    candidate_after = after
                 else:
                     self._set_status(f"核对第 {attempt} 次：未读到，继续等待")
-                if time.time() >= deadline:
+                if time.monotonic() >= deadline:
                     break
                 self._sleep_interruptible(0.25)
+
+            if confirmed_after is None:
+                self._log_debug(
+                    f"计数核对未完成两次一致确认：action_id={self.pending_action_id} "
+                    f"before={before} last_read={last_read}")
+                self._set_status("计数核对超时，已暂停；下次启动将按 pending 自动结算 1 次")
+                raise CountSafetyError("点击后未在 1 秒内完成两次一致识别")
+            after = confirmed_after
 
             old_progress = guard.progress
             progress, note = guard.confirm(before, after)
             delta = max(1, progress - old_progress)
             self.count_progress = progress
+            # 进度提交与 pending 清除必须在同一次原子保存中完成，避免崩溃后重复结算。
+            self._clear_pending()
             self.ui_queue.put(("count_progress", progress))
             self._set_status(
                 f"本轮完成：{before} → {after if after is not None else '?'}，{note}，"
@@ -2344,8 +2758,8 @@ class AutoClicker:
         # 按下键
         if key == "right":
             mouse_right_down()
-        elif HAS_KEYBOARD:
-            keyboard.press(key)
+        else:
+            _send_key_event_vk(key_name_to_vk(key), True)
         self.right_thread = threading.Thread(target=self._right_hold_loop, daemon=True)
         self.right_thread.start()
         self.btn_right.config(text="松开键")
@@ -2361,15 +2775,15 @@ class AutoClicker:
             if elapsed > random.uniform(2.0, 5.0):
                 if key == "right":
                     mouse_right_up()
-                elif HAS_KEYBOARD:
-                    keyboard.release(key)
+                else:
+                    _send_key_event_vk(key_name_to_vk(key), False)
                 time.sleep(random.uniform(0.01, 0.03))
                 if not self.right_held:
                     break
                 if key == "right":
                     mouse_right_down()
-                elif HAS_KEYBOARD:
-                    keyboard.press(key)
+                else:
+                    _send_key_event_vk(key_name_to_vk(key), True)
                 hold_start = time.time()
             # 随机微抖动（±1-3px），模拟手部自然颤抖
             if random.random() < 0.3:
@@ -2387,8 +2801,8 @@ class AutoClicker:
         key = self.hold_key
         if key == "right":
             mouse_right_up()
-        elif HAS_KEYBOARD:
-            keyboard.release(key)
+        else:
+            _send_key_event_vk(key_name_to_vk(key), False)
         self.btn_right.config(text="按住键")
         self.status_var.set(f"{key_display(key)} 已松开")
 
@@ -2407,11 +2821,6 @@ class AutoClicker:
             self._win_hotkey_stop.set()
             self._release_right()
             self._unregister_hotkey()
-            if keyboard is not None:
-                try:
-                    keyboard.unhook_all()
-                except Exception:
-                    pass
             self._save_now()
         except Exception:
             pass
@@ -2440,7 +2849,7 @@ def run_selftest():
         f"数据文件：{CONFIG_PATH}",
         f"数据文件可写：{'是' if os.access(os.path.dirname(CONFIG_PATH), os.W_OK) else '否'}",
         f"方案数量：{len(cfg['profiles'])}（{', '.join(cfg['profiles'].keys())}）",
-        f"键盘库 keyboard：{'可用' if HAS_KEYBOARD else '不可用'}",
+        "键盘输入：ctypes SendInput 可用",
         "热键：启停 {} / 按住键 {}({}) / 运行开始时同步按住键：{}".format(
             key_display(cfg["profiles"][cfg["current_profile"]]["hotkey"]),
             key_display(cfg["profiles"][cfg["current_profile"]].get("hold_key", "right")),
@@ -2449,6 +2858,7 @@ def run_selftest():
         f"管理员权限：{'是' if is_admin() else '否'}",
         f"Tcl/Tk 运行库：{TCL_RUNTIME or '使用系统自带（源码运行）'}",
         f"OCR Pillow：{'可用' if HAS_PIL_OCR else '不可用'}",
+        f"OCR RapidOCR：{'可用' if ocr_status['rapidocr'] else '不可用'}",
         f"OCR pytesseract：{'可用' if HAS_PYTesseract_OCR else '不可用'}",
         f"OCR WinRT（Windows 自带）：{'可用' if ocr_status['winrt'] else '不可用'}",
         f"Tesseract：{resolve_tesseract() or '未找到'}",
@@ -2468,6 +2878,9 @@ def run_selftest():
         except Exception:
             font = ImageFont.load_default()
         draw.text((8, 6), "123456", fill=0, font=font)
+        rapid_value, rapid_ms = probe_rapidocr(sample)
+        lines.append("RapidOCR 实测：识别 {} 耗时 {:.0f}ms".format(
+            rapid_value if rapid_value is not None else "失败", rapid_ms))
         win_value, win_ms = probe_winrt_ocr(sample)
         lines.append("WinRT 实测：识别 {} 耗时 {:.0f}ms".format(
             win_value if win_value is not None else "失败", win_ms))

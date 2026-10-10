@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """打包脚本：复制 Tcl/Tk 运行库、暂存 Tesseract 最小依赖，然后运行 PyInstaller 生成单文件 exe。
 
 Tcl/Tk：必须显式打包 tcl8.6 / tk8.6 目录、tcl86t.dll、tk86t.dll 与 _tkinter.pyd，
@@ -7,6 +7,7 @@ Tesseract：用 pefile 分析 tesseract.exe 的 DLL 导入闭包，只暂存实�
 DLL + eng.traineddata，避免把 150MB 无关 DLL 全部塞进 exe。
 """
 import os
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -16,15 +17,16 @@ try:
 except ImportError:
     pefile = None
 
-APP_VERSION = "v37"
-PYTHON = r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\python.exe"
-TCL_SRC = r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\tcl"
-DLL_SRC = r"C:\Users\A\AppData\Local\Python\pythoncore-3.14-64\DLLs"
+APP_VERSION = "v39"
+PYTHON = os.environ.get("PYTHON_EXECUTABLE", sys.executable)
+TCL_SRC = os.path.join(sys.prefix, "tcl")
+DLL_SRC = os.path.join(sys.prefix, "DLLs")
 TESS_SRC = r"C:\Program Files\Tesseract-OCR"
-WORK_DIR = r"C:\Users\A\Documents\Codex\auto-clicker"
+WORK_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUTS = os.path.join(WORK_DIR, "outputs")
 TEMP_TCL = os.path.join(WORK_DIR, "_temp_tcl")
 TESS_STAGE = os.path.join(WORK_DIR, "work", "tesseract-stage")
+RAPIDOCR_MODELS_SRC = os.path.join(WORK_DIR, "work", "rapidocr-models")
 DIST_DIR = os.path.join(OUTPUTS, "dist")
 BUILD_DIR = os.path.join(WORK_DIR, "work", "build")
 SPEC_DIR = os.path.join(WORK_DIR, "work", "spec")
@@ -95,6 +97,19 @@ def stage_tesseract():
     return TESS_STAGE
 
 
+def stage_rapidocr_models():
+    """把离线 RapidOCR 模型复制到发布目录，exe 启动时从同目录 models/rapidocr 加载。"""
+    if not os.path.isdir(RAPIDOCR_MODELS_SRC):
+        print("未找到自定义 RapidOCR 模型；使用 OCR 包内置的离线模型。")
+        return False
+    target = os.path.join(DIST_DIR, "models", "rapidocr")
+    if os.path.exists(target):
+        shutil.rmtree(target)
+    shutil.copytree(RAPIDOCR_MODELS_SRC, target)
+    print(f"RapidOCR 模型已复制到 {target}")
+    return True
+
+
 def main():
     stage_tcl()
     tesseract_stage = stage_tesseract()
@@ -110,7 +125,6 @@ def main():
         "--add-binary", os.path.join(DLL_SRC, "tcl86t.dll") + ";.",
         "--add-binary", os.path.join(DLL_SRC, "tk86t.dll") + ";.",
         "--add-binary", os.path.join(DLL_SRC, "_tkinter.pyd") + ";.",
-        "--hidden-import", "keyboard",
         "--hidden-import", "PIL",
         "--hidden-import", "PIL.Image",
         "--hidden-import", "PIL.ImageGrab",
@@ -123,13 +137,20 @@ def main():
         "--hidden-import", "winrt.windows.globalization",
         "--hidden-import", "winrt.windows.foundation",
         "--hidden-import", "winrt.windows.foundation.collections",
+        "--hidden-import", "onnxruntime",
         "--collect-submodules", "winrt",
+        "--collect-all", "onnxruntime",
+        "--collect-all", "cv2",
         "--distpath", DIST_DIR,
         "--workpath", BUILD_DIR,
         "--specpath", SPEC_DIR,
         "--noconfirm",
         os.path.join(OUTPUTS, "auto_clicker.py"),
     ]
+    for package in ("rapidocr", "rapidocr_onnxruntime"):
+        if importlib.util.find_spec(package):
+            insert_at = cmd.index("--distpath")
+            cmd[insert_at:insert_at] = ["--hidden-import", package, "--collect-all", package]
     if tesseract_stage:
         insert_at = cmd.index("--distpath")
         cmd[insert_at:insert_at] = ["--add-data", f"{tesseract_stage};tesseract"]
@@ -148,10 +169,7 @@ def main():
     size_mb = os.path.getsize(exe_path) / 1024 / 1024
     print(f"打包完成: {exe_path} ({size_mb:.1f} MB)")
 
-    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    desktop_path = os.path.join(desktop, f"{EXE_NAME}.exe")
-    shutil.copy2(exe_path, desktop_path)
-    print(f"已复制到桌面: {desktop_path}")
+    stage_rapidocr_models()
 
     shutil.rmtree(TEMP_TCL, ignore_errors=True)
     if tesseract_stage:

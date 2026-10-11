@@ -11,7 +11,7 @@
 
 > 无需安装 Python，建议右键「以管理员身份运行」。历史版本与更新公告见 [Releases 页面](https://github.com/xyz0218xy-ops/auto-clicker/releases)。
 
-当前工作副本为 v41，尚未发布到 GitHub Releases。本地构建产物在 `outputs/dist/AutoClicker-v41.exe`，修复内容见 [release-notes-v41.md](release-notes-v41.md)。
+当前工作副本为 v42，尚未发布到 GitHub Releases。本地构建产物在 `outputs/dist/AutoClicker-v42.exe`，修复内容见 [release-notes-v42.md](release-notes-v42.md)。
 
 ## 功能
 
@@ -31,7 +31,7 @@
 
 详见 [CHANGELOG.md](CHANGELOG.md)
 
-### 当前工作副本 v41 (2026-10-11)
+### 当前工作副本 v42 (2026-10-11)
 - 兼容带 UTF-8 BOM 的配置文件，避免旧方案被误当成空方案
 - 修复热键重新设置后的线程切换，优化 Boss 卡 OCR 等待与错误提示
 - 缩小采集列表字号与序号列宽；更新离线 RapidOCR 打包支持
@@ -41,6 +41,7 @@
 - 预热按配置只初始化实际使用的视觉后端；默认路径不加载 RapidOCR，Windows OCR 只创建引擎，首次启动等待从约 1 秒降到约 30–40 ms
 - 视觉区域连续 3 次识别失败时自动暂停，状态栏和 `debug.log` 写出具体区域坐标，避免无限刷“读取失败”
 - 恢复 `keyboard` 低级钩子作为全局热键主后端；焦点在其他窗口时也能触发，Win32 注册和状态轮询继续作为后备
+- 增加程序自己的 Windows `WH_KEYBOARD_LL` 全局钩子，独立线程监听失焦状态下的 F12/F8 等热键，避免第三方钩子或 RegisterHotKey 在特定桌面环境失效
 
 ### GitHub 已发布 v37 (2026-10-07)
 - 击杀 Boss 后自动衔接下一轮：持续轮询召唤界面，不再有固定等待，也不再需要停止重启

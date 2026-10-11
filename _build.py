@@ -17,7 +17,7 @@ try:
 except ImportError:
     pefile = None
 
-APP_VERSION = "v41"
+APP_VERSION = "v42"
 PYTHON = os.environ.get("PYTHON_EXECUTABLE", sys.executable)
 TCL_SRC = os.path.join(sys.prefix, "tcl")
 DLL_SRC = os.path.join(sys.prefix, "DLLs")

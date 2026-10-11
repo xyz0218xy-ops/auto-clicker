@@ -97,6 +97,19 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(loaded["current_profile"], "已有方案")
         self.assertEqual(len(loaded["profiles"]["已有方案"]["items"]), 1)
 
+    def test_low_level_hotkey_routes_virtual_key_without_focus(self):
+        app = auto_clicker.AutoClicker.__new__(auto_clicker.AutoClicker)
+        app.hotkey = "f12"
+        app.right_hotkey = "f8"
+        app.capturing = False
+        app._last_hotkey_trigger = {"hotkey": 0.0, "right_hotkey": 0.0}
+        calls = []
+        app._on_hotkey = lambda: calls.append("hotkey")
+        app._on_right_hotkey = lambda: calls.append("right")
+        app._handle_low_level_vk(0x7B)
+        app._handle_low_level_vk(0x77)
+        self.assertEqual(calls, ["hotkey", "right"])
+
     def test_global_hotkey_backend_registers_outside_focus(self):
         class FakeKeyboard:
             def __init__(self):

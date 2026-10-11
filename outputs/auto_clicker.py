@@ -190,7 +190,7 @@ HAS_KEYBOARD = True
 
 # ── 常量 ────────────────────────────────────────────────────────────────────
 APP_NAME = "自动点击器"
-APP_VERSION = "v41"
+APP_VERSION = "v42"
 CONFIG_NAME = "click_positions.json"
 
 MIN_INTERVAL = 0.05       # 最小间隔（秒）
@@ -239,6 +239,10 @@ MOUSEEVENTF_WHEEL = 0x0800
 KEYEVENTF_KEYUP = 0x0002
 WM_HOTKEY = 0x0312
 PM_REMOVE = 0x0001
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
+LLKHF_INJECTED = 0x00000010
 
 # --- Raw Input (兼容游戏的鼠标输入捕获) ---
 
@@ -284,6 +288,24 @@ class MSG(ctypes.Structure):
         ("time", ctypes.wintypes.DWORD),
         ("pt", ctypes.wintypes.POINT),
     ]
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", ctypes.wintypes.DWORD),
+        ("scanCode", ctypes.wintypes.DWORD),
+        ("flags", ctypes.wintypes.DWORD),
+        ("time", ctypes.wintypes.DWORD),
+        ("dwExtraInfo", getattr(ctypes.wintypes, "ULONG_PTR", ctypes.c_void_p)),
+    ]
+
+
+LowLevelKeyboardProc = ctypes.WINFUNCTYPE(
+    getattr(ctypes.wintypes, "LRESULT", ctypes.c_ssize_t),
+    ctypes.c_int,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM,
+)
 
 def _pixel_to_abs(x, y):
     """将像素坐标转换为 SendInput 绝对坐标 (0-65535)。"""
@@ -949,6 +971,11 @@ class AutoClicker:
         self._last_hotkey_trigger = {"hotkey": 0.0, "right_hotkey": 0.0}
         self._win_hotkey_stop = threading.Event()
         self._win_hotkey_thread = None
+        self._ll_hook_stop = threading.Event()
+        self._ll_hook_thread = None
+        self._ll_hook_handle = None
+        self._ll_hook_ready = False
+        self._ll_keyboard_proc = None
 
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} {APP_VERSION}")
@@ -2243,8 +2270,10 @@ class AutoClicker:
         self._win_hotkey_thread = threading.Thread(
             target=self._win_hotkey_worker, args=(self._win_hotkey_stop,), daemon=True)
         self._win_hotkey_thread.start()
+        self._start_low_level_hotkey_hook()
 
     def _unregister_hotkey(self):
+        self._stop_low_level_hotkey_hook()
         if HAS_GLOBAL_HOTKEY:
             for handle in (getattr(self, "hotkey_handle", None),
                            getattr(self, "right_hotkey_handle", None)):
@@ -2262,6 +2291,97 @@ class AutoClicker:
         self._win_hotkey_thread = None
         self.hotkey_handle = None
         self.right_hotkey_handle = None
+
+    def _start_low_level_hotkey_hook(self):
+        """安装进程自己的 WH_KEYBOARD_LL 全局钩子，不依赖前台窗口焦点。"""
+        self._stop_low_level_hotkey_hook()
+        self._ll_hook_stop = threading.Event()
+        self._ll_hook_ready = False
+        self._ll_hook_thread = threading.Thread(
+            target=self._low_level_hotkey_worker,
+            args=(self._ll_hook_stop,),
+            daemon=True,
+        )
+        self._ll_hook_thread.start()
+
+    def _stop_low_level_hotkey_hook(self):
+        stop_event = getattr(self, "_ll_hook_stop", None)
+        if stop_event is not None:
+            stop_event.set()
+        worker = getattr(self, "_ll_hook_thread", None)
+        if worker and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=0.8)
+        self._ll_hook_thread = None
+        self._ll_hook_handle = None
+        self._ll_hook_ready = False
+        self._ll_keyboard_proc = None
+
+    def _handle_low_level_vk(self, vk_code):
+        """把低级钩子收到的虚拟键码映射到两个业务热键。"""
+        try:
+            vk_code = int(vk_code)
+        except (TypeError, ValueError):
+            return
+        if self.capturing:
+            return
+        hotkey_vk = key_name_to_vk(getattr(self, "hotkey", ""))
+        right_vk = key_name_to_vk(getattr(self, "right_hotkey", ""))
+        if hotkey_vk and vk_code == hotkey_vk:
+            self._on_hotkey()
+        elif right_vk and right_vk != hotkey_vk and vk_code == right_vk:
+            self._on_right_hotkey()
+
+    def _low_level_hotkey_worker(self, stop_event):
+        """低级键盘钩子线程；消息泵独立于 Tk 窗口焦点。"""
+        callback_ref = None
+        hook_handle = None
+        try:
+            user32.SetWindowsHookExW.argtypes = [
+                ctypes.c_int, LowLevelKeyboardProc, ctypes.wintypes.HINSTANCE, ctypes.wintypes.DWORD]
+            user32.SetWindowsHookExW.restype = ctypes.wintypes.HHOOK
+            user32.CallNextHookEx.argtypes = [
+                ctypes.wintypes.HHOOK, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
+            user32.CallNextHookEx.restype = ctypes.wintypes.LRESULT
+            user32.UnhookWindowsHookEx.argtypes = [ctypes.wintypes.HHOOK]
+            user32.UnhookWindowsHookEx.restype = ctypes.wintypes.BOOL
+
+            def callback(n_code, w_param, l_param):
+                if n_code >= 0 and int(w_param) in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                    try:
+                        info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                        if not (int(info.flags) & LLKHF_INJECTED):
+                            self._handle_low_level_vk(info.vkCode)
+                    except Exception:
+                        pass
+                return user32.CallNextHookEx(hook_handle, n_code, w_param, l_param)
+
+            callback_ref = LowLevelKeyboardProc(callback)
+            hook_handle = user32.SetWindowsHookExW(WH_KEYBOARD_LL, callback_ref, None, 0)
+            self._ll_keyboard_proc = callback_ref
+            self._ll_hook_handle = hook_handle
+            self._ll_hook_ready = bool(hook_handle)
+            if not hook_handle:
+                self._log_debug("WH_KEYBOARD_LL 注册失败，继续使用其他全局热键后备")
+                return
+            msg = MSG()
+            while not stop_event.is_set():
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
+                    if int(msg.message) == 0x0012:  # WM_QUIT
+                        stop_event.set()
+                        break
+                time.sleep(0.01)
+        except Exception as exc:
+            self._ll_hook_ready = False
+            self._log_debug("WH_KEYBOARD_LL 初始化失败：%s" % exc)
+        finally:
+            if hook_handle:
+                try:
+                    user32.UnhookWindowsHookEx(hook_handle)
+                except Exception:
+                    pass
+            self._ll_hook_handle = None
+            self._ll_keyboard_proc = None
+            self._ll_hook_ready = False
 
     def _win_hotkey_worker(self, stop_event):
         """使用 Windows RegisterHotKey 提供最后一层全局热键后备。"""
